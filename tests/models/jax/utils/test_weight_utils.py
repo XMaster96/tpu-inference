@@ -14,20 +14,28 @@
 
 import os
 import tempfile
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import torch
 from flax import nnx
 from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 from safetensors.torch import save_file
 from torch import nn
 from vllm.model_executor.model_loader import LoadConfig, get_model_loader
 
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.linear import JaxLinear
-from tpu_inference.models.jax.utils.weight_utils import LoadableWithIterator
+from tpu_inference.models.jax.utils.weight_utils import (
+    LoadableWithIterator,
+    MetadataMap,
+    _build_modlax_llama_restore_template,
+    _iter_modlax_llama_hf_weights,
+    load_hf_weights,
+)
 
 
 class TorchMLP(nn.Module):
@@ -108,3 +116,137 @@ class TestJaxAutoWeightsLoader:
                                    jax_output,
                                    rtol=1e-3,
                                    atol=1e-2)
+
+
+class TestModlaxOrbaxLlamaSupport:
+
+    def test_build_modlax_llama_restore_template(self):
+        devices = jax.local_devices()
+        mesh = Mesh(np.array(devices[:1]), axis_names=("model", ))
+        checkpoint_config = {
+            "dtype": "bfloat16",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "tie_word_embeddings": False,
+            "adapter_iffm": None,
+            "num_routing_experts": None,
+        }
+
+        template = _build_modlax_llama_restore_template(checkpoint_config, mesh)
+
+        assert template["token_embed"].shape == (32, 8)
+        assert template["token_embed"].dtype == jnp.bfloat16
+        assert template["token_embed"].sharding.spec == P(None, "model")
+        assert template["layers_0"]["self_attn"]["q_proj"]["kernel"].shape == (8, 8)
+        assert template["layers_0"]["self_attn"]["o_proj"]["kernel"].shape == (8, 8)
+        assert template["layers_0"]["mlp"]["gate"]["kernel"].shape == (8, 16)
+        assert template["layers_0"]["mlp"]["down"]["kernel"].shape == (16, 8)
+        assert template["final_norm"]["weight"].shape == (8, )
+        assert template["lm_head"]["weight"].shape == (32, 8)
+
+    def test_iter_modlax_llama_hf_weights(self):
+        checkpoint_config = {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "tie_word_embeddings": False,
+            "adapter_iffm": None,
+        }
+        params = {
+            "token_embed": jnp.arange(32 * 8, dtype=jnp.float32).reshape(32, 8),
+            "layers_0": {
+                "input_layernorm": {
+                    "weight": jnp.ones((8, ), dtype=jnp.float32),
+                },
+                "self_attn": {
+                    "q_proj": {
+                        "kernel": jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
+                    },
+                    "k_proj": {
+                        "kernel": jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
+                    },
+                    "v_proj": {
+                        "kernel": jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
+                    },
+                    "o_proj": {
+                        "kernel": jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
+                    },
+                },
+                "post_attention_layernorm": {
+                    "weight": jnp.ones((8, ), dtype=jnp.float32),
+                },
+                "mlp": {
+                    "gate": {
+                        "kernel": jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
+                    },
+                    "up": {
+                        "kernel": jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
+                    },
+                    "down": {
+                        "kernel": jnp.arange(16 * 8, dtype=jnp.float32).reshape(16, 8),
+                    },
+                },
+            },
+            "final_norm": {
+                "weight": jnp.ones((8, ), dtype=jnp.float32),
+            },
+            "lm_head": {
+                "weight": jnp.arange(32 * 8, dtype=jnp.float32).reshape(32, 8),
+            },
+        }
+
+        hf_weights = dict(_iter_modlax_llama_hf_weights(params, checkpoint_config))
+        assert "model.embed_tokens.weight" in hf_weights
+        assert "model.layers.0.self_attn.q_proj.weight" in hf_weights
+        assert "model.layers.0.self_attn.o_proj.weight" in hf_weights
+        assert "model.layers.0.mlp.down_proj.weight" in hf_weights
+        assert "model.norm.weight" in hf_weights
+        assert "lm_head.weight" in hf_weights
+
+        np.testing.assert_allclose(
+            np.asarray(hf_weights["model.layers.0.self_attn.q_proj.weight"]),
+            np.asarray(params["layers_0"]["self_attn"]["q_proj"]["kernel"].T),
+        )
+        np.testing.assert_allclose(
+            np.asarray(hf_weights["model.layers.0.self_attn.o_proj.weight"]),
+            np.asarray(params["layers_0"]["self_attn"]["o_proj"]["kernel"].T),
+        )
+
+    def test_modlax_path_takes_priority_over_runai_iterator(self):
+        devices = np.array(jax.local_devices()[:1])
+        mesh = Mesh(devices, axis_names=("model", ))
+        model = JaxMLP(rngs=nnx.Rngs(0))
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.model = "unused-model-path"
+        vllm_config.model_config.runai_model_weights_iterator = [
+            ("unused.key", torch.ones((1, )))
+        ]
+        vllm_config.model_config.hf_config.architectures = ["LlamaForCausalLM"]
+        vllm_config.load_config.download_dir = None
+        vllm_config.speculative_config = None
+
+        with patch(
+                "tpu_inference.models.jax.utils.weight_utils._select_modlax_orbax_checkpoint_path",
+                return_value="gs://dummy-orbax-checkpoint"), patch(
+                    "tpu_inference.models.jax.utils.weight_utils._load_modlax_orbax_llama_weights"
+                ) as modlax_loader, patch(
+                    "tpu_inference.models.jax.utils.weight_utils._load_and_shard_weight",
+                    side_effect=AssertionError(
+                        "RunAI iterator path should not be used for Modlax Orbax checkpoints."
+                    )):
+            load_hf_weights(vllm_config=vllm_config,
+                            model=model,
+                            metadata_map=MetadataMap(),
+                            mesh=mesh)
+
+        modlax_loader.assert_called_once()

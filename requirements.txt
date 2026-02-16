@@ -7,6 +7,7 @@ numpy
 google-cloud-storage
 jax[tpu]==0.8.0
 jaxlib==0.8.0
+orbax-checkpoint
 jaxtyping
 flax==0.11.1
 torchax==0.0.10
@@ -16,3 +17,4 @@ pathwaysutils
 parameterized
 numba==0.62.1
 runai-model-streamer[s3,gcs]==0.15.0
+pyyaml

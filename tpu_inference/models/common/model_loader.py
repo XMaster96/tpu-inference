@@ -35,7 +35,8 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     load_random_weights_into_qwix_abstract_model,
     update_vllm_config_for_qwix_quantization)
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
-                                                         LoadableWithIterator)
+                                                         LoadableWithIterator,
+                                                         _is_modlax_orbax_checkpoint)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
@@ -211,16 +212,21 @@ def _get_nnx_model(
                 model_weights = vllm_config.model_config.model
                 if hasattr(vllm_config.model_config, "model_weights"):
                     model_weights = vllm_config.model_config.model_weights
-                weights_iterator = loader._get_weights_iterator(
-                    model_weights, vllm_config.model_config.revision)
-                # We set the weights iterator at runtime, to prevent having to change
-                # every model's load_weights signature. This also prevents us from hitting
-                # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
-                # flax_nnx model whose load_weights function does not accept the
-                # weights_iterator keyword argument.
-                vllm_config.model_config.runai_model_weights_iterator = weights_iterator
+
+                # Modlax Orbax checkpoints are loaded directly in weight_utils.
+                # Skip setting a RunAI safetensors iterator in this case.
+                if not _is_modlax_orbax_checkpoint(model_weights):
+                    weights_iterator = loader._get_weights_iterator(
+                        model_weights, vllm_config.model_config.revision)
+                    # We set the weights iterator at runtime, to prevent having to change
+                    # every model's load_weights signature. This also prevents us from hitting
+                    # a TypeError at runtime if you use the RunaiModelStreamerLoader with any
+                    # flax_nnx model whose load_weights function does not accept the
+                    # weights_iterator keyword argument.
+                    vllm_config.model_config.runai_model_weights_iterator = weights_iterator
                 model.load_weights(rng)
-                del vllm_config.model_config.runai_model_weights_iterator
+                if hasattr(vllm_config.model_config, "runai_model_weights_iterator"):
+                    del vllm_config.model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)
             jit_model = create_jit_model(
