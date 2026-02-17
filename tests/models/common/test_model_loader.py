@@ -121,6 +121,58 @@ def test_get_model_architecture_unsupported():
         model_loader._get_model_architecture(config)
 
 
+def test_override_hf_config_from_modlax_orbax(vllm_config):
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        with open(os.path.join(checkpoint_path, "_CHECKPOINT_METADATA"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(checkpoint_path, "model_config.yml"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write(
+                "\n".join([
+                    "dtype: bfloat16",
+                    "head_dim: 128",
+                    "hidden_act: silu",
+                    "hidden_size: 5120",
+                    "intermediate_size: 32768",
+                    "max_position_embeddings: 32768",
+                    "num_attention_heads: 32",
+                    "num_hidden_layers: 40",
+                    "num_key_value_heads: 16",
+                    "rope_scaling: 1.0",
+                    "rope_theta: 100000000.0",
+                    "tie_word_embeddings: false",
+                    "attention_bias: false",
+                    "mlp_bias: false",
+                    "vocab_size: 131072",
+                ]))
+
+        # Start with a non-Llama config, then verify override.
+        vllm_config.model_config.model_weights = checkpoint_path
+        assert vllm_config.model_config.hf_config.architectures != [
+            "LlamaForCausalLM"
+        ]
+
+        model_loader._maybe_override_hf_config_with_modlax_orbax(vllm_config,
+                                                                  False)
+        hf_config = vllm_config.model_config.hf_config
+        assert hf_config.architectures == ["LlamaForCausalLM"]
+        assert hf_config.hidden_size == 5120
+        assert hf_config.intermediate_size == 32768
+        assert hf_config.num_hidden_layers == 40
+        assert hf_config.num_attention_heads == 32
+        assert hf_config.num_key_value_heads == 16
+        assert hf_config.head_dim == 128
+        assert hf_config.vocab_size == 131072
+        assert hf_config.max_position_embeddings == 32768
+        assert hf_config.rope_theta == 100000000.0
+        assert hf_config.tie_word_embeddings is False
+
+
 @pytest.fixture(autouse=True)
 def clear_model_registry_after_test():
     """Clear the model registry after each test to prevent side effects."""

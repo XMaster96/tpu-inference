@@ -17,9 +17,10 @@ from typing import Any, Optional
 
 import jax
 import torch
+from etils import epath
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 from vllm.config import VllmConfig
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.runai_streamer_loader import \
@@ -52,6 +53,84 @@ _VLLM_PREFERRED_ARCHITECTURES: frozenset[str] = frozenset(
 class UnsupportedArchitectureError(ValueError):
     """Raised when a model architecture is not supported in the registry."""
     pass
+
+
+def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
+                                         is_draft_model: bool) -> str | None:
+    if is_draft_model:
+        return None
+    model_weights = getattr(vllm_config.model_config, "model_weights", None)
+    if _is_modlax_orbax_checkpoint(model_weights):
+        return model_weights
+    model_path = getattr(vllm_config.model_config, "model", None)
+    if _is_modlax_orbax_checkpoint(model_path):
+        return model_path
+    return None
+
+
+def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
+                                             ) -> LlamaConfig:
+    rope_scaling = checkpoint_config.get("rope_scaling")
+    # Modlax stores scalar rope scaling while HF expects None or dict.
+    if isinstance(rope_scaling, (int, float)):
+        rope_scaling = None
+    return LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=int(checkpoint_config["hidden_size"]),
+        intermediate_size=int(checkpoint_config["intermediate_size"]),
+        num_hidden_layers=int(checkpoint_config["num_hidden_layers"]),
+        num_attention_heads=int(checkpoint_config["num_attention_heads"]),
+        num_key_value_heads=int(checkpoint_config["num_key_value_heads"]),
+        head_dim=int(checkpoint_config["head_dim"]),
+        vocab_size=int(checkpoint_config["vocab_size"]),
+        max_position_embeddings=int(checkpoint_config["max_position_embeddings"]),
+        rope_theta=float(checkpoint_config["rope_theta"]),
+        rope_scaling=rope_scaling,
+        hidden_act=checkpoint_config.get("hidden_act", "silu"),
+        rms_norm_eps=float(checkpoint_config.get("rms_norm_eps", 1e-5)),
+        tie_word_embeddings=bool(checkpoint_config.get("tie_word_embeddings",
+                                                       True)),
+        attention_bias=bool(checkpoint_config.get("attention_bias", False)),
+        mlp_bias=bool(checkpoint_config.get("mlp_bias", False)),
+    )
+
+
+def _maybe_override_hf_config_with_modlax_orbax(vllm_config: VllmConfig,
+                                                 is_draft_model: bool) -> None:
+    checkpoint_path = _select_modlax_orbax_checkpoint_path(
+        vllm_config, is_draft_model)
+    if checkpoint_path is None:
+        return
+    if getattr(vllm_config.model_config, "_modlax_orbax_config_source",
+               None) == checkpoint_path:
+        return
+
+    model_config_path = epath.Path(checkpoint_path) / "model_config.yml"
+    if not model_config_path.exists():
+        raise FileNotFoundError(
+            f"Missing model_config.yml in Modlax Orbax checkpoint path: {checkpoint_path}"
+        )
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError(
+            "PyYAML is required to parse Modlax model_config.yml.") from exc
+
+    checkpoint_config = yaml.safe_load(
+        model_config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError(
+            f"Expected YAML mapping in {model_config_path}, got {type(checkpoint_config).__name__}."
+        )
+    hf_config = _build_hf_llama_config_from_modlax_orbax(checkpoint_config)
+    vllm_config.model_config.hf_config = hf_config
+    # Some vLLM code paths read from hf_text_config.
+    if hasattr(vllm_config.model_config, "hf_text_config"):
+        vllm_config.model_config.hf_text_config = hf_config
+    vllm_config.model_config._modlax_orbax_config_source = checkpoint_path
+    logger.info("Loaded Llama config from Modlax Orbax checkpoint: %s",
+                checkpoint_path)
 
 
 def _get_model_architecture(config: PretrainedConfig) -> nnx.Module:
@@ -242,6 +321,7 @@ def get_flax_model(
     mesh: Mesh,
     is_draft_model: bool = False,
 ) -> nnx.Module:
+    _maybe_override_hf_config_with_modlax_orbax(vllm_config, is_draft_model)
     model_dtype = to_jax_dtype(vllm_config.model_config.dtype)
     vllm_config.model_config.dtype = model_dtype
 
@@ -377,6 +457,7 @@ def get_model(
     mesh: Mesh,
     is_draft_model: bool = False,
 ) -> Any:
+    _maybe_override_hf_config_with_modlax_orbax(vllm_config, is_draft_model)
     impl = envs.MODEL_IMPL_TYPE
     logger.info(f"Loading model with MODEL_IMPL_TYPE={impl}")
     if impl == "auto":
