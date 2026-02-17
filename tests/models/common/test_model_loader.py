@@ -173,6 +173,26 @@ def test_override_hf_config_from_modlax_orbax(vllm_config):
         assert hf_config.tie_word_embeddings is False
 
 
+def test_select_modlax_orbax_checkpoint_path_resolves_child(vllm_config):
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+        final_model_path = os.path.join(checkpoint_path, "final_model")
+        os.makedirs(final_model_path, exist_ok=True)
+        with open(os.path.join(final_model_path, "_CHECKPOINT_METADATA"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(final_model_path, "model_config.yml"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("hidden_size: 16\n")
+
+        vllm_config.model_config.model_weights = checkpoint_path
+        resolved = model_loader._select_modlax_orbax_checkpoint_path(
+            vllm_config, False)
+        assert resolved == final_model_path
+
+
 @pytest.fixture(autouse=True)
 def clear_model_registry_after_test():
     """Clear the model registry after each test to prevent side effects."""

@@ -92,27 +92,131 @@ def _canonical_jax_dtype(dtype_name: str) -> jnp.dtype:
     return dtype_map[normalized]
 
 
-def _load_yaml_dict(path: epath.Path) -> dict[str, Any]:
+def _split_gcs_uri(path: str) -> tuple[str, str] | None:
+    if not path.startswith("gs://"):
+        return None
+    uri_body = path[5:].strip("/")
+    if not uri_body:
+        return None
+    bucket_name, *object_parts = uri_body.split("/", 1)
+    if not bucket_name:
+        return None
+    object_path = object_parts[0] if object_parts else ""
+    return bucket_name, object_path
+
+
+def _gcs_blob_exists(blob_uri: str) -> bool:
+    parsed = _split_gcs_uri(blob_uri)
+    if parsed is None:
+        return False
+    bucket_name, object_path = parsed
+    if not object_path:
+        return False
+    from google.cloud import storage
+
+    client = storage.Client()
+    return client.bucket(bucket_name).blob(object_path).exists()
+
+
+def _read_gcs_text(blob_uri: str, encoding: str = "utf-8") -> str:
+    parsed = _split_gcs_uri(blob_uri)
+    if parsed is None:
+        raise ValueError(f"Expected gs:// URI, got: {blob_uri}")
+    bucket_name, object_path = parsed
+    if not object_path:
+        raise ValueError(f"Expected gs:// URI with object path, got: {blob_uri}")
+    from google.cloud import storage
+
+    client = storage.Client()
+    return client.bucket(bucket_name).blob(object_path).download_as_text(
+        encoding=encoding)
+
+
+def _checkpoint_member_path(checkpoint_path: str, member_name: str) -> str:
+    return f"{checkpoint_path.rstrip('/')}/{member_name}"
+
+
+def _checkpoint_path_candidates(path: str) -> list[str]:
+    normalized = path.rstrip("/")
+    candidates = [normalized]
+    if normalized.endswith("/final_model"):
+        parent = normalized.rsplit("/", 1)[0]
+        if parent:
+            candidates.append(parent)
+    else:
+        candidates.append(f"{normalized}/final_model")
+    deduped_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped_candidates:
+            deduped_candidates.append(candidate)
+    return deduped_candidates
+
+
+def _path_exists(path: str) -> bool:
+    exists = False
+    try:
+        exists = epath.Path(path).exists()
+    except Exception:
+        exists = False
+
+    if exists:
+        return True
+    if not path.startswith("gs://"):
+        return False
+
+    try:
+        return _gcs_blob_exists(path)
+    except Exception:
+        return False
+
+
+def _read_text(path: str, encoding: str = "utf-8") -> str:
+    try:
+        return epath.Path(path).read_text(encoding=encoding)
+    except Exception:
+        if not path.startswith("gs://"):
+            raise
+    return _read_gcs_text(path, encoding=encoding)
+
+
+def _load_yaml_dict(path: str) -> dict[str, Any]:
     try:
         import yaml
     except ImportError as exc:
         raise ImportError("PyYAML is required to parse Modlax model_config.yml.") from exc
 
-    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    payload = yaml.safe_load(_read_text(path, encoding="utf-8")) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Expected YAML mapping at {path}, got {type(payload).__name__}.")
     return payload
 
 
 def _is_modlax_orbax_checkpoint(path: str | None) -> bool:
+    return _resolve_modlax_orbax_checkpoint_path(path) is not None
+
+
+def _resolve_modlax_orbax_checkpoint_path(path: str | None) -> str | None:
     if not path:
-        return False
-    try:
-        checkpoint_root = epath.Path(path)
-        return (checkpoint_root / "model_config.yml").exists() and (
-            checkpoint_root / "_CHECKPOINT_METADATA").exists()
-    except Exception:
-        return False
+        return None
+    for candidate in _checkpoint_path_candidates(path):
+        config_path = _checkpoint_member_path(candidate, "model_config.yml")
+        metadata_path = _checkpoint_member_path(candidate,
+                                                "_CHECKPOINT_METADATA")
+        if _path_exists(config_path) and _path_exists(metadata_path):
+            return candidate
+    return None
+
+
+def _load_modlax_orbax_checkpoint_config(checkpoint_path: str) -> dict[str, Any]:
+    resolved_checkpoint_path = _resolve_modlax_orbax_checkpoint_path(
+        checkpoint_path)
+    if resolved_checkpoint_path is None:
+        raise FileNotFoundError(
+            f"Missing model_config.yml in Modlax Orbax checkpoint path: {checkpoint_path}"
+        )
+    model_config_path = _checkpoint_member_path(resolved_checkpoint_path,
+                                                "model_config.yml")
+    return _load_yaml_dict(model_config_path)
 
 
 def _get_model_axis_name(mesh: Mesh) -> str:
@@ -303,10 +407,13 @@ def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
                                          model_path: str) -> str | None:
     model_weights_override = getattr(vllm_config.model_config, "model_weights",
                                      None)
-    if _is_modlax_orbax_checkpoint(model_weights_override):
-        return model_weights_override
-    if _is_modlax_orbax_checkpoint(model_path):
-        return model_path
+    resolved_override = _resolve_modlax_orbax_checkpoint_path(
+        model_weights_override)
+    if resolved_override is not None:
+        return resolved_override
+    resolved_model_path = _resolve_modlax_orbax_checkpoint_path(model_path)
+    if resolved_model_path is not None:
+        return resolved_model_path
     return None
 
 
@@ -329,20 +436,22 @@ def _load_modlax_orbax_llama_weights(
             "Modlax Orbax loading currently supports LlamaForCausalLM only."
         )
 
-    checkpoint_root = epath.Path(checkpoint_path)
-    model_config_path = checkpoint_root / "model_config.yml"
-    if not model_config_path.exists():
+    resolved_checkpoint_path = _resolve_modlax_orbax_checkpoint_path(
+        checkpoint_path)
+    if resolved_checkpoint_path is None:
         raise FileNotFoundError(
-            f"Missing model_config.yml in Modlax Orbax checkpoint path: {checkpoint_path}"
+            f"Modlax Orbax checkpoint markers were not found at: {checkpoint_path}"
         )
 
-    checkpoint_config = _load_yaml_dict(model_config_path)
+    checkpoint_config = _load_modlax_orbax_checkpoint_config(
+        resolved_checkpoint_path)
     restore_template = _build_modlax_llama_restore_template(checkpoint_config,
                                                              mesh)
     ocp = _import_orbax_checkpoint()
-    logger.info("Loading Modlax Orbax Llama checkpoint from %s", checkpoint_path)
+    logger.info("Loading Modlax Orbax Llama checkpoint from %s",
+                resolved_checkpoint_path)
     with ocp.StandardCheckpointer() as checkpointer:
-        restored_params = checkpointer.restore(str(checkpoint_root),
+        restored_params = checkpointer.restore(resolved_checkpoint_path,
                                                target=restore_template)
 
     # Ensure arrays are materialized before transformation.

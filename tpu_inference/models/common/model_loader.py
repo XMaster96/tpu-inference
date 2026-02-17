@@ -17,7 +17,6 @@ from typing import Any, Optional
 
 import jax
 import torch
-from etils import epath
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import LlamaConfig, PretrainedConfig
@@ -37,7 +36,9 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     update_vllm_config_for_qwix_quantization)
 from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
                                                          LoadableWithIterator,
-                                                         _is_modlax_orbax_checkpoint)
+                                                         _is_modlax_orbax_checkpoint,
+                                                         _load_modlax_orbax_checkpoint_config,
+                                                         _resolve_modlax_orbax_checkpoint_path)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
@@ -60,11 +61,14 @@ def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
     if is_draft_model:
         return None
     model_weights = getattr(vllm_config.model_config, "model_weights", None)
-    if _is_modlax_orbax_checkpoint(model_weights):
-        return model_weights
+    resolved_model_weights = _resolve_modlax_orbax_checkpoint_path(
+        model_weights)
+    if resolved_model_weights is not None:
+        return resolved_model_weights
     model_path = getattr(vllm_config.model_config, "model", None)
-    if _is_modlax_orbax_checkpoint(model_path):
-        return model_path
+    resolved_model_path = _resolve_modlax_orbax_checkpoint_path(model_path)
+    if resolved_model_path is not None:
+        return resolved_model_path
     return None
 
 
@@ -105,24 +109,7 @@ def _maybe_override_hf_config_with_modlax_orbax(vllm_config: VllmConfig,
                None) == checkpoint_path:
         return
 
-    model_config_path = epath.Path(checkpoint_path) / "model_config.yml"
-    if not model_config_path.exists():
-        raise FileNotFoundError(
-            f"Missing model_config.yml in Modlax Orbax checkpoint path: {checkpoint_path}"
-        )
-
-    try:
-        import yaml
-    except ImportError as exc:
-        raise ImportError(
-            "PyYAML is required to parse Modlax model_config.yml.") from exc
-
-    checkpoint_config = yaml.safe_load(
-        model_config_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(checkpoint_config, dict):
-        raise ValueError(
-            f"Expected YAML mapping in {model_config_path}, got {type(checkpoint_config).__name__}."
-        )
+    checkpoint_config = _load_modlax_orbax_checkpoint_config(checkpoint_path)
     hf_config = _build_hf_llama_config_from_modlax_orbax(checkpoint_config)
     vllm_config.model_config.hf_config = hf_config
     # Some vLLM code paths read from hf_text_config.

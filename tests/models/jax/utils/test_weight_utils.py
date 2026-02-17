@@ -33,7 +33,10 @@ from tpu_inference.models.jax.utils.weight_utils import (
     LoadableWithIterator,
     MetadataMap,
     _build_modlax_llama_restore_template,
+    _is_modlax_orbax_checkpoint,
     _iter_modlax_llama_hf_weights,
+    _load_modlax_orbax_checkpoint_config,
+    _resolve_modlax_orbax_checkpoint_path,
     load_hf_weights,
 )
 
@@ -250,3 +253,98 @@ class TestModlaxOrbaxLlamaSupport:
                             mesh=mesh)
 
         modlax_loader.assert_called_once()
+
+    @patch("google.cloud.storage.Client")
+    def test_is_modlax_orbax_checkpoint_gcs_fallback(self, mock_storage_client):
+        mock_bucket = MagicMock()
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_storage_client.return_value = mock_client
+
+        def _blob(name):
+            mock_blob = MagicMock()
+            mock_blob.exists.return_value = (
+                name.endswith("model_config.yml")
+                or name.endswith("_CHECKPOINT_METADATA"))
+            return mock_blob
+
+        mock_bucket.blob.side_effect = _blob
+
+        with patch("tpu_inference.models.jax.utils.weight_utils.epath.Path",
+                   side_effect=RuntimeError("no gcs filesystem backend")):
+            assert _is_modlax_orbax_checkpoint(
+                "gs://bucket/some/checkpoint/path")
+
+    @patch("google.cloud.storage.Client")
+    def test_load_modlax_orbax_checkpoint_config_gcs_fallback(
+            self, mock_storage_client):
+        mock_bucket = MagicMock()
+        mock_client = MagicMock()
+        mock_client.bucket.return_value = mock_bucket
+        mock_storage_client.return_value = mock_client
+
+        model_config_yaml = "\n".join([
+            "hidden_size: 16",
+            "intermediate_size: 32",
+            "num_hidden_layers: 1",
+            "num_attention_heads: 2",
+            "num_key_value_heads: 2",
+            "head_dim: 8",
+            "vocab_size: 32000",
+            "max_position_embeddings: 2048",
+            "rope_theta: 10000.0",
+        ])
+
+        def _blob(name):
+            mock_blob = MagicMock()
+            mock_blob.exists.return_value = (
+                name.endswith("model_config.yml")
+                or name.endswith("_CHECKPOINT_METADATA"))
+            if name.endswith("model_config.yml"):
+                mock_blob.download_as_text.return_value = model_config_yaml
+            return mock_blob
+
+        mock_bucket.blob.side_effect = _blob
+
+        with patch("tpu_inference.models.jax.utils.weight_utils.epath.Path",
+                   side_effect=RuntimeError("no gcs filesystem backend")):
+            config = _load_modlax_orbax_checkpoint_config(
+                "gs://bucket/some/checkpoint/path")
+        assert config["hidden_size"] == 16
+
+    def test_resolve_modlax_orbax_checkpoint_from_parent_path(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+            final_model_path = os.path.join(checkpoint_path, "final_model")
+            os.makedirs(final_model_path, exist_ok=True)
+
+            with open(os.path.join(final_model_path, "_CHECKPOINT_METADATA"),
+                      "w",
+                      encoding="utf-8") as f:
+                f.write("{}")
+            with open(os.path.join(final_model_path, "model_config.yml"),
+                      "w",
+                      encoding="utf-8") as f:
+                f.write("hidden_size: 16\n")
+
+            resolved_path = _resolve_modlax_orbax_checkpoint_path(
+                checkpoint_path)
+            assert resolved_path == final_model_path
+
+    def test_resolve_modlax_orbax_checkpoint_from_final_model_path(self):
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+            os.makedirs(checkpoint_path, exist_ok=True)
+
+            with open(os.path.join(checkpoint_path, "_CHECKPOINT_METADATA"),
+                      "w",
+                      encoding="utf-8") as f:
+                f.write("{}")
+            with open(os.path.join(checkpoint_path, "model_config.yml"),
+                      "w",
+                      encoding="utf-8") as f:
+                f.write("hidden_size: 16\n")
+
+            resolved_path = _resolve_modlax_orbax_checkpoint_path(
+                os.path.join(checkpoint_path, "final_model"))
+            assert resolved_path == checkpoint_path
