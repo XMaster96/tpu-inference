@@ -430,6 +430,14 @@ class TPUWorker:
                                                transpose_keys=transpose_keys,
                                                reshard_fn=reshard_fn)
 
+    def reload_model_weights(self,
+                             checkpoint_path: Optional[str] = None,
+                             release_kv_cache: bool = True) -> dict:
+        """Reload model weights in-place without restarting the worker."""
+        return self.model_runner.reload_model_weights(
+            checkpoint_path,
+            release_kv_cache=release_kv_cache)
+
     def shutdown(self) -> None:
         return
 

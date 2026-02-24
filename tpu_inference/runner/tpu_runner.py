@@ -14,8 +14,10 @@
 
 import copy
 import functools
+import gc
 import logging
 import random
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -63,6 +65,7 @@ from tpu_inference.models.common.model_loader import get_model
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
+    _is_modlax_orbax_checkpoint, _load_modlax_orbax_checkpoint_config,
     shard_put, transfer_state_with_mappings)
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
@@ -1709,6 +1712,205 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             request, kv_cache_slices, block_ids)
 
     ###### RL framework integration ######
+
+    def reload_model_weights(self,
+                             checkpoint_path: str | None = None,
+                             release_kv_cache: bool = True) -> dict:
+        """Reload model weights from a Modlax Orbax checkpoint in-place.
+
+        This preserves compiled JAX programs by reusing the existing graphdef and
+        only replacing ``self.state``.
+        """
+        start_time = time.perf_counter()
+        hbm_before = self._get_reload_hbm_stats()
+        gc.collect()
+
+        model_config = self.vllm_config.model_config
+        target_checkpoint = (checkpoint_path
+                             or getattr(model_config, "model_weights", None)
+                             or model_config.model)
+        if not target_checkpoint:
+            raise ValueError("No checkpoint path was provided for reload.")
+        if not _is_modlax_orbax_checkpoint(target_checkpoint):
+            raise FileNotFoundError(
+                "Modlax Orbax checkpoint markers were not found at "
+                f"{target_checkpoint!r}.")
+
+        # Enforce strict architecture compatibility for live reload.
+        # Cross-architecture swaps (e.g. 12B <-> 24B) are intentionally
+        # unsupported.
+        self._assert_reload_checkpoint_compatible(target_checkpoint)
+
+        if not isinstance(self.model_fn, functools.partial) or not self.model_fn.args:
+            raise RuntimeError(
+                "Live weight reload currently requires MODEL_IMPL_TYPE=flax_nnx."
+            )
+
+        # Route subsequent loader calls to the new checkpoint.
+        model_config.model_weights = target_checkpoint
+
+        had_kv_cache = bool(self.kv_caches)
+        release_elapsed_s = 0.0
+        release_state_elapsed_s = 0.0
+        rebuild_elapsed_s = 0.0
+        hbm_after_release = hbm_before
+        hbm_after_state_release = hbm_before
+        hbm_after_load = hbm_before
+
+        if had_kv_cache and release_kv_cache:
+            release_start = time.perf_counter()
+            released_entries = self._release_kv_cache_for_reload()
+            release_elapsed_s = time.perf_counter() - release_start
+            hbm_after_release = self._get_reload_hbm_stats()
+        else:
+            released_entries = 0
+
+        release_state_start = time.perf_counter()
+        released_state_entries = self._release_model_state_for_reload()
+        release_state_elapsed_s = time.perf_counter() - release_state_start
+        hbm_after_state_release = self._get_reload_hbm_stats()
+
+        # Re-merge graphdef + state, run model-specific load_weights(), then
+        # extract the updated state back. This keeps all compiled call-sites.
+        graphdef = self.model_fn.args[0]
+        model = nnx.merge(graphdef, self.state)
+        load_elapsed_s = 0.0
+        load_error: Exception | None = None
+        rebuild_error: Exception | None = None
+        try:
+            load_start = time.perf_counter()
+            model.load_weights(self.rng_key)
+            load_elapsed_s = time.perf_counter() - load_start
+            self.state = nnx.state(model)
+            gc.collect()
+            hbm_after_load = self._get_reload_hbm_stats()
+        except Exception as exc:  # noqa: BLE001
+            load_error = exc
+        finally:
+            if had_kv_cache and release_kv_cache:
+                try:
+                    rebuild_start = time.perf_counter()
+                    self._rebuild_kv_cache_after_reload()
+                    rebuild_elapsed_s = time.perf_counter() - rebuild_start
+                except Exception as exc:  # noqa: BLE001
+                    rebuild_error = exc
+
+        hbm_after = self._get_reload_hbm_stats()
+        total_elapsed_s = time.perf_counter() - start_time
+
+        if load_error is not None and rebuild_error is not None:
+            raise RuntimeError(
+                "Reload failed while also failing to rebuild KV cache. "
+                f"load_error={load_error!r}; rebuild_error={rebuild_error!r}"
+            ) from rebuild_error
+        if rebuild_error is not None:
+            raise rebuild_error
+        if load_error is not None:
+            raise load_error
+
+        return {
+            "status": "ok",
+            "checkpoint_path": target_checkpoint,
+            "reload_mode": "kv_and_state" if release_kv_cache else "state_only",
+            "timing_s": {
+                "release_kv_cache": round(release_elapsed_s, 4),
+                "release_state": round(release_state_elapsed_s, 4),
+                "load_weights": round(load_elapsed_s, 4),
+                "rebuild_kv_cache": round(rebuild_elapsed_s, 4),
+                "total": round(total_elapsed_s, 4),
+            },
+            "hbm_before": hbm_before,
+            "hbm_after_release": hbm_after_release,
+            "hbm_after_state_release": hbm_after_state_release,
+            "hbm_after_load": hbm_after_load,
+            "hbm_after": hbm_after,
+            "kv_cache_entries": len(self.kv_caches),
+            "released_kv_cache_entries": released_entries,
+            "released_state_entries": released_state_entries,
+        }
+
+    def _get_reload_hbm_stats(self) -> dict[str, float]:
+        usage = common_utils.hbm_usage_bytes(self.devices)
+        total_used = sum(used for used, _ in usage)
+        total_limit = sum(limit for _, limit in usage)
+        return {
+            "used_gib": round(total_used / common_utils.GBYTES, 3),
+            "limit_gib": round(total_limit / common_utils.GBYTES, 3),
+            "free_gib": round((total_limit - total_used) / common_utils.GBYTES, 3),
+        }
+
+    def _assert_reload_checkpoint_compatible(self, checkpoint_path: str) -> None:
+        checkpoint_cfg = _load_modlax_orbax_checkpoint_config(checkpoint_path)
+        hf_cfg = self.model_config.hf_config
+
+        model_head_dim = getattr(hf_cfg, "head_dim", None)
+        if model_head_dim is None:
+            hidden_size = getattr(hf_cfg, "hidden_size", None)
+            num_attention_heads = getattr(hf_cfg, "num_attention_heads", None)
+            if hidden_size is not None and num_attention_heads:
+                model_head_dim = int(hidden_size) // int(num_attention_heads)
+
+        expected: dict[str, int | bool | None] = {
+            "hidden_size": getattr(hf_cfg, "hidden_size", None),
+            "intermediate_size": getattr(hf_cfg, "intermediate_size", None),
+            "num_hidden_layers": getattr(hf_cfg, "num_hidden_layers", None),
+            "num_attention_heads": getattr(hf_cfg, "num_attention_heads", None),
+            "num_key_value_heads": getattr(hf_cfg, "num_key_value_heads", None),
+            "head_dim": model_head_dim,
+            "vocab_size": getattr(hf_cfg, "vocab_size", None),
+            "tie_word_embeddings": getattr(hf_cfg, "tie_word_embeddings", None),
+            "max_position_embeddings": getattr(hf_cfg,
+                                               "max_position_embeddings", None),
+        }
+
+        for key, expected_value in expected.items():
+            checkpoint_value = checkpoint_cfg.get(key)
+            assert checkpoint_value is not None, (
+                "Live reload requires matching architecture metadata; "
+                f"checkpoint is missing required key {key!r}.")
+            assert expected_value is not None, (
+                "Live reload requires matching architecture metadata; "
+                f"running model is missing required key {key!r}.")
+            if isinstance(expected_value, bool):
+                assert bool(checkpoint_value) == expected_value, (
+                    "Checkpoint architecture mismatch for "
+                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}")
+            else:
+                assert int(checkpoint_value) == int(expected_value), (
+                    "Checkpoint architecture mismatch for "
+                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}")
+
+    def _release_kv_cache_for_reload(self) -> int:
+        released_entries = len(self.kv_caches)
+        for kv_cache in self.kv_caches:
+            if hasattr(kv_cache, "delete"):
+                kv_cache.delete()
+        self.kv_caches.clear()
+        self.layer_name_to_kvcache_index.clear()
+        self.execute_model_state = None
+        self._pre_async_results = None
+        gc.collect()
+        return released_entries
+
+    def _rebuild_kv_cache_after_reload(self) -> None:
+        if not hasattr(self, "kv_cache_config") or self.kv_cache_config is None:
+            return
+        self.initialize_kv_cache(self.kv_cache_config,
+                                 getattr(self, "topology_order_id", 0))
+
+    def _release_model_state_for_reload(self) -> int:
+        released_entries = 0
+        for leaf in jax.tree_util.tree_leaves(self.state):
+            if hasattr(leaf, "delete"):
+                leaf.delete()
+                released_entries += 1
+                continue
+            value = getattr(leaf, "value", None)
+            if hasattr(value, "delete"):
+                value.delete()
+                released_entries += 1
+        gc.collect()
+        return released_entries
 
     def _sync_weights(
         self,
