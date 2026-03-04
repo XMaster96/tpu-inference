@@ -92,6 +92,72 @@ def _weights_ready(app_state) -> bool:
     return (not app_state.require_first_reload) or app_state.first_weights_loaded.is_set()
 
 
+def _patch_async_scheduler_preempt_discard() -> None:
+    """Patch AsyncScheduler to avoid discarding valid post-reload tokens.
+
+    vLLM marks force-preempted requests with ``discard_latest_async_tokens``.
+    If the output loop is already quiesced before preemption, there is no stale
+    in-flight token to drop. Discarding the next token in that case can desync
+    strict structured-output requests across live reload.
+    """
+    try:
+        from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+        from vllm.v1.request import RequestStatus
+    except Exception:
+        return
+
+    if getattr(AsyncScheduler, "_tpu_preempt_discard_patch_installed", False):
+        return
+
+    original_update_with_output = AsyncScheduler._update_request_with_output
+
+    def _patched_update_request_with_output(self, request, new_token_ids):
+        if (
+            getattr(request, "discard_latest_async_tokens", False)
+            and getattr(request, "status", None) == RequestStatus.RUNNING
+        ):
+            request.discard_latest_async_tokens = False
+        return original_update_with_output(self, request, new_token_ids)
+
+    AsyncScheduler._update_request_with_output = _patched_update_request_with_output
+    AsyncScheduler._tpu_preempt_discard_patch_installed = True
+
+
+def _ensure_pause_controls_supported(engine: EngineClient) -> None:
+    required_attrs = (
+        "_pause_cond",
+        "_paused",
+    )
+    missing = [attr for attr in required_attrs if not hasattr(engine, attr)]
+    if missing:
+        raise RuntimeError(
+            "Live reload preemption requires AsyncLLM pause internals; missing: "
+            + ", ".join(missing)
+        )
+
+
+async def _set_generation_paused(engine: EngineClient, paused: bool) -> bool:
+    async with engine._pause_cond:
+        was_paused = bool(engine._paused)
+        engine._paused = paused
+        if not paused:
+            engine._pause_cond.notify_all()
+        return was_paused
+
+
+async def _preempt_running_requests(engine: EngineClient) -> None:
+    """Force-preempt all running requests and clear their prefix-KV state."""
+    reset_ok = await engine.reset_prefix_cache(
+        reset_running_requests=True,
+        reset_connector=False,
+    )
+    if not reset_ok:
+        raise RuntimeError(
+            "reset_prefix_cache returned failure while preempting "
+            "running requests"
+        )
+
+
 @router.post(
     "/v1/completions",
     dependencies=[Depends(validate_json_request)],
@@ -189,7 +255,10 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
       omitted, workers reload the current checkpoint already tracked by server
       state.
     - ``wait_for_inflight_requests`` (bool, default ``False``): If ``True``,
-      pause waits for running requests to complete before reloading.
+      pause waits for running requests to complete before reloading. If
+      ``False``, running requests are preempted (not aborted) and resumed after
+      reload from the same in-engine request state, including structured output
+      FSM state (for strict regex/grammar continuity).
     - ``clear_cache`` (bool, default ``True``): Clears prefix/cache state during
       pause to reduce stale cache effects across checkpoints.
     - ``release_kv_cache`` (bool, default ``True``): Requests worker-side KV
@@ -215,13 +284,35 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
     """
     app_state = raw_request.app.state
     engine = engine_client(raw_request)
+    manual_pause_mode = False
+    should_unpause_manually = False
+    used_pause_generation = False
 
     async with app_state.reload_lock:
         try:
-            await engine.pause_generation(
-                wait_for_inflight_requests=payload.wait_for_inflight_requests,
-                clear_cache=payload.clear_cache,
-            )
+            if payload.wait_for_inflight_requests:
+                await engine.pause_generation(
+                    wait_for_inflight_requests=True,
+                    clear_cache=payload.clear_cache,
+                )
+                used_pause_generation = True
+            else:
+                _ensure_pause_controls_supported(engine)
+                manual_pause_mode = True
+                was_paused = await _set_generation_paused(engine, True)
+                should_unpause_manually = not was_paused
+                if not payload.clear_cache:
+                    logger.warning(
+                        "reload_weights called with wait_for_inflight_requests=false "
+                        "and clear_cache=false; forcing prefix-cache reset with "
+                        "request preemption to preserve inflight correctness."
+                    )
+
+                # Preempt running requests instead of aborting them. This keeps
+                # per-request state (including structured-output FSM progression)
+                # while forcing KV recomputation under the new weights.
+                await _preempt_running_requests(engine)
+
             rpc_args = (
                 (payload.checkpoint_path,)
                 if payload.checkpoint_path is not None
@@ -233,6 +324,13 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                 args=rpc_args,
                 kwargs={"release_kv_cache": payload.release_kv_cache},
             )
+
+            if manual_pause_mode:
+                # Re-preempt after reload so request scheduler state stays
+                # consistent with freshly reinitialized worker KV caches.
+                await _preempt_running_requests(engine)
+                if payload.clear_cache:
+                    await engine.reset_mm_cache()
         except Exception as exc:
             logger.exception("Live model reload failed")
             raise HTTPException(
@@ -240,7 +338,11 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                 detail=f"Live model reload failed: {exc}",
             ) from exc
         finally:
-            await engine.resume_generation()
+            if manual_pause_mode:
+                if should_unpause_manually:
+                    await _set_generation_paused(engine, False)
+            elif used_pause_generation:
+                await engine.resume_generation()
 
         if payload.checkpoint_path is not None:
             app_state.current_checkpoint_path = payload.checkpoint_path
@@ -379,6 +481,7 @@ def build_minimal_app(args: Namespace) -> FastAPI:
 
 async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     decorate_logs("OnlineRLServer")
+    _patch_async_scheduler_preempt_discard()
     require_first_reload, checkpoint_path = _configure_initial_reload_mode(args)
 
     listen_address, sock = setup_server(args)
