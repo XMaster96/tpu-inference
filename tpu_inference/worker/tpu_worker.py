@@ -438,6 +438,9 @@ class TPUWorker:
             checkpoint_path,
             release_kv_cache=release_kv_cache)
 
+    def invalidate_live_reload_state(self) -> None:
+        self.model_runner.invalidate_live_reload_state()
+
     def shutdown(self) -> None:
         return
 

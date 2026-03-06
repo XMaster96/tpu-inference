@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import copy
 import importlib
 import inspect
 from argparse import Namespace
@@ -92,6 +93,52 @@ def _weights_ready(app_state) -> bool:
     return (not app_state.require_first_reload) or app_state.first_weights_loaded.is_set()
 
 
+def _get_reload_generation(scheduler) -> int:
+    return int(getattr(scheduler, "_tpu_reload_generation", 0))
+
+
+def _mark_scheduler_output_reload_generation(scheduler, scheduler_output) -> None:
+    setattr(
+        scheduler_output,
+        "_tpu_reload_generation",
+        _get_reload_generation(scheduler),
+    )
+
+
+def _is_stale_scheduler_output(scheduler, scheduler_output) -> bool:
+    output_generation = getattr(scheduler_output, "_tpu_reload_generation", None)
+    if output_generation is None:
+        return False
+    return int(output_generation) != _get_reload_generation(scheduler)
+
+
+def _filter_scheduler_output_missing_req_indices(scheduler_output, model_runner_output):
+    req_id_to_index = getattr(model_runner_output, "req_id_to_index", {}) or {}
+    num_scheduled_tokens = dict(
+        getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+    )
+    missing_req_ids = tuple(
+        req_id for req_id in num_scheduled_tokens if req_id not in req_id_to_index
+    )
+    if not missing_req_ids:
+        return scheduler_output, ()
+
+    filtered_output = copy.copy(scheduler_output)
+    filtered_output.num_scheduled_tokens = {
+        req_id: num_tokens
+        for req_id, num_tokens in num_scheduled_tokens.items()
+        if req_id in req_id_to_index
+    }
+    filtered_output.scheduled_spec_decode_tokens = {
+        req_id: token_ids
+        for req_id, token_ids in getattr(
+            scheduler_output, "scheduled_spec_decode_tokens", {}
+        ).items()
+        if req_id in req_id_to_index
+    }
+    return filtered_output, missing_req_ids
+
+
 def _patch_async_scheduler_preempt_discard() -> None:
     """Patch AsyncScheduler to avoid discarding valid post-reload tokens.
 
@@ -121,6 +168,65 @@ def _patch_async_scheduler_preempt_discard() -> None:
 
     AsyncScheduler._update_request_with_output = _patched_update_request_with_output
     AsyncScheduler._tpu_preempt_discard_patch_installed = True
+
+
+def _patch_scheduler_reload_stale_output() -> None:
+    """Patch Scheduler to drop model outputs invalidated by live reload preemption."""
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+    except Exception:
+        return
+
+    if getattr(Scheduler, "_tpu_reload_stale_output_patch_installed", False):
+        return
+
+    original_schedule = Scheduler.schedule
+    original_reset_prefix_cache = Scheduler.reset_prefix_cache
+    original_update_from_output = Scheduler.update_from_output
+
+    def _patched_schedule(self, *args, **kwargs):
+        scheduler_output = original_schedule(self, *args, **kwargs)
+        _mark_scheduler_output_reload_generation(self, scheduler_output)
+        return scheduler_output
+
+    def _patched_reset_prefix_cache(self, *args, **kwargs):
+        reset_running_requests = bool(kwargs.get("reset_running_requests", False))
+        if args:
+            reset_running_requests = bool(args[0])
+        reset_ok = original_reset_prefix_cache(self, *args, **kwargs)
+        if reset_running_requests and reset_ok:
+            self._tpu_reload_generation = _get_reload_generation(self) + 1
+        return reset_ok
+
+    def _patched_update_from_output(self, scheduler_output, model_runner_output):
+        if _is_stale_scheduler_output(self, scheduler_output):
+            stale_req_ids = tuple(
+                getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
+            )
+            if stale_req_ids:
+                logger.warning(
+                    "Dropping stale scheduler output after live reload preemption "
+                    "for request ids: %s",
+                    stale_req_ids,
+                )
+            return {}
+
+        filtered_output, missing_req_ids = _filter_scheduler_output_missing_req_indices(
+            scheduler_output,
+            model_runner_output,
+        )
+        if missing_req_ids:
+            logger.warning(
+                "Dropping stale model output entries missing request indices "
+                "after live reload preemption for request ids: %s",
+                missing_req_ids,
+            )
+        return original_update_from_output(self, filtered_output, model_runner_output)
+
+    Scheduler.schedule = _patched_schedule
+    Scheduler.reset_prefix_cache = _patched_reset_prefix_cache
+    Scheduler.update_from_output = _patched_update_from_output
+    Scheduler._tpu_reload_stale_output_patch_installed = True
 
 
 def _ensure_pause_controls_supported(engine: EngineClient) -> None:
@@ -156,6 +262,21 @@ async def _preempt_running_requests(engine: EngineClient) -> None:
             "reset_prefix_cache returned failure while preempting "
             "running requests"
         )
+
+
+async def _invalidate_live_reload_worker_state(
+    engine: EngineClient,
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    rpc_kwargs = {
+        "method": "invalidate_live_reload_state",
+        "args": (),
+        "kwargs": {},
+    }
+    if timeout_seconds is not None:
+        rpc_kwargs["timeout"] = timeout_seconds
+    await engine.collective_rpc(**rpc_kwargs)
 
 
 @router.post(
@@ -308,6 +429,12 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                         "request preemption to preserve inflight correctness."
                     )
 
+                # Invalidate any async TPU decode state before preempting so
+                # stale in-flight outputs are dropped at the reload boundary.
+                await _invalidate_live_reload_worker_state(
+                    engine,
+                    timeout_seconds=payload.timeout_seconds,
+                )
                 # Preempt running requests instead of aborting them. This keeps
                 # per-request state (including structured-output FSM progression)
                 # while forcing KV recomputation under the new weights.
@@ -326,6 +453,10 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
             )
 
             if manual_pause_mode:
+                await _invalidate_live_reload_worker_state(
+                    engine,
+                    timeout_seconds=payload.timeout_seconds,
+                )
                 # Re-preempt after reload so request scheduler state stays
                 # consistent with freshly reinitialized worker KV caches.
                 await _preempt_running_requests(engine)
@@ -482,6 +613,7 @@ def build_minimal_app(args: Namespace) -> FastAPI:
 async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     decorate_logs("OnlineRLServer")
     _patch_async_scheduler_preempt_discard()
+    _patch_scheduler_reload_stale_output()
     require_first_reload, checkpoint_path = _configure_initial_reload_mode(args)
 
     listen_address, sock = setup_server(args)

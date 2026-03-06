@@ -639,6 +639,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
             # Updated on previous execute
             end_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            if end_idx <= 0 or not req_state.output_token_ids:
+                logger.warning(
+                    "Dropping stale async sampled token for request %s after "
+                    "live reload preemption.",
+                    req_id,
+                )
+                continue
             assert len(sampled_ids) == 1, "do not support spec decode yet"
             start_idx = end_idx - 1
             assert end_idx <= self.max_model_len, (
@@ -650,6 +657,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                                            start_idx:end_idx] = sampled_ids
             # Replace previous placeholder
             req_state.output_token_ids[-1] = sampled_ids[-1]
+
+    def invalidate_live_reload_state(self) -> None:
+        self.execute_model_state = None
+        self._pre_async_results = None
 
     def _update_placeholder(self,
                             discard_sampled_tokens_req_indices,
