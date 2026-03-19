@@ -41,6 +41,30 @@ logger = init_logger(__name__)
 init_fn = nnx.initializers.uniform()
 
 
+def _resolve_llama_4_scaling(config: LlamaConfig) -> dict[str, float] | None:
+    llama_4_scaling = getattr(config, "llama_4_scaling", None)
+    if isinstance(llama_4_scaling, dict):
+        return {
+            "beta": float(llama_4_scaling["beta"]),
+            "original_max_position_embeddings":
+            float(llama_4_scaling["original_max_position_embeddings"]),
+        }
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if not isinstance(rope_scaling, dict):
+        return None
+    scaling_beta = rope_scaling.get("llama_4_scaling_beta")
+    original_max_position_embeddings = rope_scaling.get(
+        "original_max_position_embeddings")
+    if scaling_beta is None or original_max_position_embeddings is None:
+        return None
+    return {
+        "beta": float(scaling_beta),
+        "original_max_position_embeddings":
+        float(original_max_position_embeddings),
+    }
+
+
 class LlamaMLP(nnx.Module):
 
     def __init__(self, config: LlamaConfig, dtype: jnp.dtype, rng: nnx.Rngs):
@@ -94,6 +118,7 @@ class LlamaAttention(nnx.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.rope_theta = config.rope_theta
         self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.llama_4_scaling = _resolve_llama_4_scaling(config)
 
         self.head_dim_original = getattr(config, "head_dim",
                                          self.hidden_size // self.num_heads)
@@ -160,6 +185,11 @@ class LlamaAttention(nnx.Module):
         q = self.q_proj(x)
         q = apply_rope(q, md.input_positions, self.head_dim_original,
                        self.rope_theta, self.rope_scaling)
+        if self.llama_4_scaling is not None:
+            query_scaling = 1.0 + self.llama_4_scaling["beta"] * jnp.log1p(
+                jnp.floor(md.input_positions.astype(jnp.float32) /
+                          self.llama_4_scaling["original_max_position_embeddings"]))
+            q = q * query_scaling[:, None, None].astype(q.dtype)
         # k: (T, K, H)
         k = self.k_proj(x)
         k = apply_rope(k, md.input_positions, self.head_dim_original,

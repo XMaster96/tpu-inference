@@ -75,28 +75,93 @@ def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
 def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
                                              ) -> LlamaConfig:
     rope_scaling = checkpoint_config.get("rope_scaling")
-    # Modlax stores scalar rope scaling while HF expects None or dict.
+    # Modlax stores scalar rope scaling for the default RoPE path while HF
+    # expects None or a rope_scaling dictionary.
     if isinstance(rope_scaling, (int, float)):
         rope_scaling = None
-    return LlamaConfig(
-        architectures=["LlamaForCausalLM"],
-        hidden_size=int(checkpoint_config["hidden_size"]),
-        intermediate_size=int(checkpoint_config["intermediate_size"]),
-        num_hidden_layers=int(checkpoint_config["num_hidden_layers"]),
-        num_attention_heads=int(checkpoint_config["num_attention_heads"]),
-        num_key_value_heads=int(checkpoint_config["num_key_value_heads"]),
-        head_dim=int(checkpoint_config["head_dim"]),
-        vocab_size=int(checkpoint_config["vocab_size"]),
-        max_position_embeddings=int(checkpoint_config["max_position_embeddings"]),
-        rope_theta=float(checkpoint_config["rope_theta"]),
-        rope_scaling=rope_scaling,
-        hidden_act=checkpoint_config.get("hidden_act", "silu"),
-        rms_norm_eps=float(checkpoint_config.get("rms_norm_eps", 1e-5)),
-        tie_word_embeddings=bool(checkpoint_config.get("tie_word_embeddings",
-                                                       True)),
-        attention_bias=bool(checkpoint_config.get("attention_bias", False)),
-        mlp_bias=bool(checkpoint_config.get("mlp_bias", False)),
-    )
+    elif isinstance(rope_scaling, dict):
+        rope_scaling = dict(rope_scaling)
+
+    if rope_scaling is None and checkpoint_config.get("rope_type") == "yarn":
+        rope_yarn_config = checkpoint_config.get("rope_yarn_config")
+        if not isinstance(rope_yarn_config, dict):
+            raise ValueError(
+                "Modlax Orbax checkpoint declares rope_type='yarn' but is "
+                "missing a rope_yarn_config mapping."
+            )
+        rope_scaling = {
+            "type": "yarn",
+            "rope_type": "yarn",
+            "factor": float(rope_yarn_config["factor"]),
+            "original_max_position_embeddings": float(
+                rope_yarn_config["original_max_position_embeddings"]),
+        }
+        for optional_key in (
+                "attention_factor",
+                "beta_fast",
+                "beta_slow",
+                "mscale",
+                "mscale_all_dim",
+                "truncate",
+                "llama_4_scaling_beta",
+        ):
+            optional_value = rope_yarn_config.get(optional_key)
+            if optional_value is None:
+                continue
+            if optional_key == "truncate":
+                rope_scaling[optional_key] = bool(optional_value)
+            else:
+                rope_scaling[optional_key] = float(optional_value)
+
+    if rope_scaling is not None and "attention_factor" in rope_scaling:
+        attn_factor = rope_scaling.get("attn_factor")
+        attention_factor = rope_scaling["attention_factor"]
+        if attn_factor is not None and attn_factor != attention_factor:
+            raise ValueError(
+                "Found conflicting attention_factor and attn_factor values in "
+                "Modlax Orbax rope_scaling."
+            )
+        rope_scaling["attn_factor"] = attention_factor
+
+    llama_4_scaling = None
+    if rope_scaling is not None:
+        scaling_beta = rope_scaling.get("llama_4_scaling_beta")
+        original_max_position_embeddings = rope_scaling.get(
+            "original_max_position_embeddings")
+        if scaling_beta is not None and original_max_position_embeddings is not None:
+            llama_4_scaling = {
+                "beta": float(scaling_beta),
+                "original_max_position_embeddings":
+                float(original_max_position_embeddings),
+            }
+
+    hf_kwargs: dict[str, Any] = {
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": int(checkpoint_config["hidden_size"]),
+        "intermediate_size": int(checkpoint_config["intermediate_size"]),
+        "num_hidden_layers": int(checkpoint_config["num_hidden_layers"]),
+        "num_attention_heads": int(checkpoint_config["num_attention_heads"]),
+        "num_key_value_heads": int(checkpoint_config["num_key_value_heads"]),
+        "head_dim": int(checkpoint_config["head_dim"]),
+        "vocab_size": int(checkpoint_config["vocab_size"]),
+        "max_position_embeddings":
+        int(checkpoint_config["max_position_embeddings"]),
+        "rope_theta": float(checkpoint_config["rope_theta"]),
+        "rope_scaling": rope_scaling,
+        "hidden_act": checkpoint_config.get("hidden_act", "silu"),
+        "rms_norm_eps": float(checkpoint_config.get("rms_norm_eps", 1e-5)),
+        "tie_word_embeddings":
+        bool(checkpoint_config.get("tie_word_embeddings", True)),
+        "attention_bias": bool(checkpoint_config.get("attention_bias", False)),
+        "mlp_bias": bool(checkpoint_config.get("mlp_bias", False)),
+        "attention_dropout":
+        float(checkpoint_config.get("attention_dropout", 0.0)),
+        "initializer_range":
+        float(checkpoint_config.get("initializer_range", 0.02)),
+    }
+    if llama_4_scaling is not None:
+        hf_kwargs["llama_4_scaling"] = llama_4_scaling
+    return LlamaConfig(**hf_kwargs)
 
 
 def _maybe_override_hf_config_with_modlax_orbax(vllm_config: VllmConfig,

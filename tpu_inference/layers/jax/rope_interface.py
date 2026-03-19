@@ -19,6 +19,110 @@ import jax
 import jax.numpy as jnp
 
 
+def _get_rope_type(rope_scaling: Dict[str, Any] | None) -> str | None:
+    if rope_scaling is None:
+        return None
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    if rope_type is None:
+        return None
+    return str(rope_type)
+
+
+def _yarn_get_mscale(scale_factor: float, mscale_value: float = 1.0) -> float:
+    if scale_factor <= 1.0:
+        return 1.0
+    return 0.1 * mscale_value * math.log(scale_factor) + 1.0
+
+
+def _resolve_yarn_attention_factor(rope_scaling: Dict[str, Any]) -> float:
+    attn_factor = rope_scaling.get("attn_factor")
+    attention_factor = rope_scaling.get("attention_factor")
+    if attn_factor is not None and attention_factor is not None and attn_factor != attention_factor:
+        raise ValueError(
+            "YaRN rope_scaling defines conflicting attn_factor and attention_factor values."
+        )
+    if attn_factor is not None:
+        return float(attn_factor)
+    if attention_factor is not None:
+        return float(attention_factor)
+
+    factor = float(rope_scaling["factor"])
+    mscale = rope_scaling.get("mscale")
+    mscale_all_dim = rope_scaling.get("mscale_all_dim")
+    if mscale is not None and mscale_all_dim is not None:
+        return _yarn_get_mscale(factor, float(mscale)) / _yarn_get_mscale(
+            factor, float(mscale_all_dim))
+    return _yarn_get_mscale(factor)
+
+
+def _apply_yarn_inv_freq(
+    inv_freq: jax.Array,
+    *,
+    rope_theta: float,
+    head_dim: int,
+    rope_scaling: Dict[str, Any],
+) -> tuple[jax.Array, float]:
+    factor = float(rope_scaling["factor"])
+    if factor <= 0.0:
+        raise ValueError("YaRN rope_scaling factor must be positive.")
+
+    original_max_position_value = rope_scaling.get(
+        "original_max_position_embeddings")
+    if original_max_position_value is None:
+        raise ValueError(
+            "YaRN rope_scaling requires original_max_position_embeddings.")
+    original_max_position_embeddings = float(original_max_position_value)
+
+    beta_fast = float(rope_scaling.get("beta_fast", 32.0))
+    beta_slow = float(rope_scaling.get("beta_slow", 1.0))
+    truncate = bool(rope_scaling.get("truncate", True))
+
+    def find_correction_dim(num_rotations: float, dimensions: int, base: float,
+                            max_positions: float) -> float:
+        return (dimensions * math.log(max_positions /
+                                      (num_rotations * 2.0 * math.pi))) / (
+                                          2.0 * math.log(base))
+
+    def find_correction_range(
+        low_rotations: float,
+        high_rotations: float,
+        dimensions: int,
+        base: float,
+        max_positions: float,
+    ) -> tuple[float, float]:
+        low_value = find_correction_dim(low_rotations, dimensions, base,
+                                        max_positions)
+        high_value = find_correction_dim(high_rotations, dimensions, base,
+                                         max_positions)
+        if truncate:
+            low_value = math.floor(low_value)
+            high_value = math.ceil(high_value)
+        return max(low_value, 0.0), min(high_value, float(dimensions - 1))
+
+    def linear_ramp_factor(minimum_value: float, maximum_value: float,
+                           dimensions: int) -> jax.Array:
+        if math.isclose(minimum_value, maximum_value):
+            maximum_value = minimum_value + 0.001
+        linear_function = (jnp.arange(dimensions, dtype=jnp.float32) -
+                           minimum_value) / (maximum_value - minimum_value)
+        return jnp.clip(linear_function, 0.0, 1.0)
+
+    low_value, high_value = find_correction_range(beta_fast, beta_slow,
+                                                  head_dim, rope_theta,
+                                                  original_max_position_embeddings)
+
+    inv_freq_extrapolation = inv_freq
+    inv_freq_interpolation = inv_freq / factor
+    inv_freq_extrapolation_factor = 1.0 - linear_ramp_factor(
+        low_value, high_value, head_dim // 2)
+    inv_freq_result = inv_freq_interpolation * (
+        1.0 - inv_freq_extrapolation_factor
+    ) + inv_freq_extrapolation * inv_freq_extrapolation_factor
+
+    attention_factor = _resolve_yarn_attention_factor(rope_scaling)
+    return inv_freq_result, attention_factor
+
+
 def apply_rope(
     # (seq_len, num_heads, head_dim)
     inputs: jax.Array,
@@ -73,7 +177,7 @@ def apply_rope(
 
             # positions[i]: (seq_len,)
             # freqs shape: (seq_len, mrope_section[i])
-            freqs = jnp.outer(positions[i], inv_freq)
+            freqs = jnp.outer(positions[i].astype(jnp.float32), inv_freq)
 
             cos_list.append(jnp.cos(freqs))
             sin_list.append(jnp.sin(freqs))
@@ -101,19 +205,29 @@ def apply_rope(
         # Calculate inverse frequencies (timescale)
         fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
         timescale = 1.0 / (rope_theta**fraction)
+        attention_factor = 1.0
 
         # Apply scaling if provided
         if rope_scaling:
-            timescale = apply_rope_scaling(timescale, rope_scaling)
+            if _get_rope_type(rope_scaling) == "yarn":
+                timescale, attention_factor = _apply_yarn_inv_freq(
+                    timescale,
+                    rope_theta=rope_theta,
+                    head_dim=head_dim,
+                    rope_scaling=rope_scaling,
+                )
+            else:
+                timescale = apply_rope_scaling(timescale, rope_scaling)
 
         # Prepare for rotation by calculating sin and cos values
         # `sinusoid_inp` gets shape (batch * seq_len, head_dim/2)
-        sinusoid_inp = positions[..., jnp.newaxis] * timescale[jnp.newaxis, :]
+        sinusoid_inp = positions.astype(timescale.dtype)[..., jnp.newaxis] * timescale[
+            jnp.newaxis, :]
 
         # Broadcast over the 'heads' dimension, assuming shape (batch*seq, heads, head_dim)
         sinusoid_inp = sinusoid_inp[:, jnp.newaxis, ...]
-        sin = jnp.sin(sinusoid_inp)
-        cos = jnp.cos(sinusoid_inp)
+        sin = jnp.sin(sinusoid_inp) * attention_factor
+        cos = jnp.cos(sinusoid_inp) * attention_factor
 
         if rope_input_ordering == "interleaved":
             # Reshape to group adjacent features for rotation, matching new_apply_rope
@@ -179,7 +293,8 @@ def apply_longrope(
             (2 * jnp.arange(0, head_dim // 2)) / head_dim)))
 
     # Calculate RoPE positions
-    sinusoid_inp = positions[..., jnp.newaxis] * timescale[jnp.newaxis, :]
+    sinusoid_inp = positions.astype(timescale.dtype)[..., jnp.newaxis] * timescale[
+        jnp.newaxis, :]
     sinusoid_inp = sinusoid_inp[:, jnp.newaxis, ...]
     sin = jnp.sin(sinusoid_inp) * mscale
     cos = jnp.cos(sinusoid_inp) * mscale
