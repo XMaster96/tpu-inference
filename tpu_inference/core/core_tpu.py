@@ -572,10 +572,19 @@ class DisaggEngineCore(vLLMEngineCore):
             if engine.mm_receiver_cache is not None:
                 engine.mm_receiver_cache.clear_cache()
 
-    def reset_prefix_cache(self):
-        for engine in itertools.chain(self._prefill_engines,
-                                      self._decode_engines):
-            engine.scheduler.reset_prefix_cache()
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        all_success = True
+        for engine in itertools.chain(self._prefill_engines, self._decode_engines):
+            success = engine.scheduler.reset_prefix_cache(
+                reset_running_requests=reset_running_requests,
+                reset_connector=reset_connector,
+            )
+            all_success &= bool(success)
+        return all_success
 
 
 class DisaggEngineCoreProc(vLLMEngineCoreProc):

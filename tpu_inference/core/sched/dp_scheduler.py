@@ -180,7 +180,15 @@ def _scheduler_worker_process(
                     output_queues[command.value].put(result)
 
                 case SchedulerCommand.RESET_PREFIX_CACHE:
-                    result = scheduler.reset_prefix_cache()
+                    if data is None:
+                        reset_running_requests = False
+                        reset_connector = False
+                    else:
+                        reset_running_requests, reset_connector = data
+                    result = scheduler.reset_prefix_cache(
+                        reset_running_requests=reset_running_requests,
+                        reset_connector=reset_connector,
+                    )
                     output_queues[command.value].put(result)
 
                 case SchedulerCommand.GET_NUM_UNFINISHED_REQUESTS:
@@ -725,11 +733,19 @@ class DPScheduler(SchedulerInterface):
             total_waiting += waiting
         return total_running, total_waiting
 
-    def reset_prefix_cache(self) -> bool:
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
         """Reset prefix cache for all DP rank schedulers."""
         for rank in range(self.dp_size):
             self.input_queues[rank].put(
-                (SchedulerCommand.RESET_PREFIX_CACHE, None))
+                (
+                    SchedulerCommand.RESET_PREFIX_CACHE,
+                    (reset_running_requests, reset_connector),
+                )
+            )
 
         all_success = True
         for rank in range(self.dp_size):
