@@ -126,6 +126,9 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from tpu_inference.entrypoints.stacked_regex import install_staged_guidance_patch
+
+        install_staged_guidance_patch()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             assert not vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING, (

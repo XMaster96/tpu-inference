@@ -27,7 +27,6 @@ from vllm.entrypoints.openai.cli_args import (
     validate_parsed_serve_args,
 )
 from vllm.entrypoints.openai.completion.protocol import (
-    CompletionRequest,
     CompletionResponse,
 )
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
@@ -61,6 +60,11 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import decorate_logs
 
+from tpu_inference.entrypoints.stacked_regex import (
+    TPUCompletionRequest,
+    install_staged_guidance_patch,
+    normalize_completion_request,
+)
 from tpu_inference.models.jax.utils.weight_utils import _is_modlax_orbax_checkpoint
 
 logger = init_logger("tpu_inference.entrypoints.online_rl_server")
@@ -291,7 +295,7 @@ async def _invalidate_live_reload_worker_state(
 )
 @with_cancellation
 @load_aware_call
-async def create_completion(request: CompletionRequest, raw_request: Request):
+async def create_completion(request: TPUCompletionRequest, raw_request: Request):
     # Explicitly disable SSE streaming while preserving all non-stream
     # completion behavior from vLLM (including structured outputs handling).
     if request.stream:
@@ -319,7 +323,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return JSONResponse(content=error.model_dump(), status_code=error.error.code)
 
     try:
-        output = await handler.create_completion(request, raw_request)
+        normalized_request = normalize_completion_request(
+            request,
+            raw_request.app.state.args.structured_outputs_config.backend,
+        )
+        output = await handler.create_completion(normalized_request, raw_request)
     except Exception as exc:
         error = handler.create_error_response(exc)
         return JSONResponse(content=error.model_dump(), status_code=error.error.code)
@@ -614,6 +622,7 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     decorate_logs("OnlineRLServer")
     _patch_async_scheduler_preempt_discard()
     _patch_scheduler_reload_stale_output()
+    install_staged_guidance_patch()
     require_first_reload, checkpoint_path = _configure_initial_reload_mode(args)
 
     listen_address, sock = setup_server(args)
