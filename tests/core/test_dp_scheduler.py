@@ -661,11 +661,49 @@ class TestDPScheduler:
 
                 # Verify commands were sent
                 scheduler.input_queues[0].put.assert_called_with(
-                    (SchedulerCommand.RESET_PREFIX_CACHE, None))
+                    (SchedulerCommand.RESET_PREFIX_CACHE, (False, False)))
                 scheduler.input_queues[1].put.assert_called_with(
-                    (SchedulerCommand.RESET_PREFIX_CACHE, None))
+                    (SchedulerCommand.RESET_PREFIX_CACHE, (False, False)))
 
                 assert result is True
+
+    def test_reset_prefix_cache_with_flags(self, mock_vllm_config,
+                                           mock_kv_cache_config,
+                                           mock_structured_output_manager):
+        """Test reset_prefix_cache forwards flags to all workers."""
+        with patch(
+                'tpu_inference.core.sched.dp_scheduler._scheduler_worker_process'
+        ):
+            with patch('multiprocessing.get_context'):
+                scheduler = DPScheduler(
+                    vllm_config=mock_vllm_config,
+                    kv_cache_config=mock_kv_cache_config,
+                    structured_output_manager=mock_structured_output_manager,
+                    block_size=16,
+                )
+
+                scheduler.input_queues = [MagicMock(), MagicMock()]
+
+                mock_queue_0 = MagicMock()
+                mock_queue_0.get.return_value = True
+                mock_queue_1 = MagicMock()
+                mock_queue_1.get.return_value = False
+
+                scheduler.output_queues = {
+                    (0, "reset_prefix_cache"): mock_queue_0,
+                    (1, "reset_prefix_cache"): mock_queue_1,
+                }
+
+                result = scheduler.reset_prefix_cache(
+                    reset_running_requests=True,
+                    reset_connector=True,
+                )
+
+                scheduler.input_queues[0].put.assert_called_with(
+                    (SchedulerCommand.RESET_PREFIX_CACHE, (True, True)))
+                scheduler.input_queues[1].put.assert_called_with(
+                    (SchedulerCommand.RESET_PREFIX_CACHE, (True, True)))
+                assert result is False
 
     def test_make_stats_aggregates_from_workers(
             self, mock_vllm_config, mock_kv_cache_config,

@@ -19,8 +19,10 @@ import tpu_inference.env_override  # noqa: F401
 from tpu_inference import envs
 from tpu_inference import tpu_info as ti
 from tpu_inference.logger import init_logger
+from tpu_inference.vllm_runtime_patches import apply_vllm_runtime_patches
 
 logger = init_logger(__name__)
+apply_vllm_runtime_patches()
 
 if "proxy" in envs.JAX_PLATFORMS:
     logger.info("Running vLLM on TPU via Pathways proxy.")

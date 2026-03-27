@@ -92,6 +92,47 @@ INVALID_TOKEN_ID = -1
 MIN_NUM_SEQS = 8
 
 
+def _summarize_scheduler_output_for_empty_cycle(
+    scheduler_output: "VllmSchedulerOutput",
+) -> dict[str, object]:
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    cached_req_ids = list(getattr(cached_reqs, "req_ids", []) or [])
+    resumed_req_ids = sorted(
+        str(req_id) for req_id in (getattr(cached_reqs, "resumed_req_ids", set()) or set())
+    )
+    return {
+        "scheduled_new_req_ids": [
+            str(getattr(req, "req_id", "<unknown>"))
+            for req in (getattr(scheduler_output, "scheduled_new_reqs", None) or [])
+        ],
+        "scheduled_cached_req_ids": cached_req_ids,
+        "scheduled_cached_resumed_req_ids": resumed_req_ids,
+        "num_scheduled_tokens": dict(
+            getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+        ),
+        "finished_req_ids": sorted(
+            str(req_id)
+            for req_id in (getattr(scheduler_output, "finished_req_ids", set()) or set())
+        ),
+        "preempted_req_ids": sorted(
+            str(req_id)
+            for req_id in (getattr(scheduler_output, "preempted_req_ids", set()) or set())
+        ),
+        "has_structured_output_requests": bool(
+            getattr(scheduler_output, "has_structured_output_requests", False)
+        ),
+        "pending_structured_output_tokens": bool(
+            getattr(scheduler_output, "pending_structured_output_tokens", False)
+        ),
+        "scheduled_spec_decode_req_ids": sorted(
+            str(req_id)
+            for req_id in (
+                getattr(scheduler_output, "scheduled_spec_decode_tokens", {}) or {}
+            ).keys()
+        ),
+    }
+
+
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
     """Holds asynchronous model output specifically from a TPU runner.
 
@@ -713,7 +754,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # Why they are not preventing that is not clear to me.
             if len(scheduler_output.finished_req_ids) == 0:
                 logger.warning(
-                    "Should not schedule a request that does nothing!")
+                    "Should not schedule a request that does nothing! details=%s",
+                    _summarize_scheduler_output_for_empty_cycle(
+                        scheduler_output),
+                )
                 # raise Exception(
                 #     "Should not schedule a request that does nothing!")
             return EMPTY_MODEL_RUNNER_OUTPUT

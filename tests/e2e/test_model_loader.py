@@ -31,6 +31,11 @@ from vllm.model_executor.models.registry import ModelRegistry
 from tpu_inference.models.common.model_loader import (_MODEL_REGISTRY,
                                                       register_model)
 
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/models--Qwen--Qwen3-4B/"
+    "snapshots/1cfa9a7208912126459214e8b04321603b3df60c"
+)
+
 
 @pytest.fixture
 def cleanup_registries():
@@ -198,18 +203,45 @@ def _run_server_and_bench(model_name: str, model_impl_type: str,
 
         print("Server is ready. Running benchmark...")
 
-        # Run benchmark
-        bench_cmd = [
-            "vllm", "bench", "serve", "--model", model_name, "--port",
-            str(port), "--dataset-name", "random", "--random-input-len", "50",
-            "--random-output-len", "128", "--num-prompts", "20"
-        ]
+        def run_bench(*,
+                      random_input_len: int,
+                      random_output_len: int,
+                      num_prompts: int) -> subprocess.CompletedProcess[str]:
+            bench_cmd = [
+                "vllm",
+                "bench",
+                "serve",
+                "--model",
+                model_name,
+                "--port",
+                str(port),
+                "--dataset-name",
+                "random",
+                "--random-input-len",
+                str(random_input_len),
+                "--random-output-len",
+                str(random_output_len),
+                "--num-prompts",
+                str(num_prompts),
+            ]
+            return subprocess.run(bench_cmd,
+                                  env=env,
+                                  capture_output=True,
+                                  text=True)
 
-        result = subprocess.run(bench_cmd,
-                                env=env,
-                                capture_output=True,
-                                text=True)
+        # Warm the server so the measured run reflects steady-state throughput
+        # rather than first-request compilation and cache population.
+        warmup = run_bench(random_input_len=16,
+                           random_output_len=16,
+                           num_prompts=2)
+        if warmup.returncode != 0:
+            raise RuntimeError(
+                f"Warmup benchmark failed.\nStdout: {warmup.stdout}\nStderr: {warmup.stderr}"
+            )
 
+        result = run_bench(random_input_len=50,
+                           random_output_len=128,
+                           num_prompts=20)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Benchmark failed.\nStdout: {result.stdout}\nStderr: {result.stderr}"
@@ -249,7 +281,7 @@ def test_flax_nnx_vs_vllm_performance():
     backends and asserts that the percentage
     difference is within a reasonable threshold.
     """
-    model_name = "Qwen/Qwen3-4B"
+    model_name = MODEL_NAME
     # This should be 2-3% but 6% reduces flakiness.
     percentage_difference_threshold = 0.06
 

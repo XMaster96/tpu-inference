@@ -63,15 +63,26 @@ class ShardingAxisName2D:
     VOCAB = ('data', 'model')
 
 
-try:
-    _use_2d_tp_sharding = envs.USE_2D_TP
-    _use_base_sharding = envs.NEW_MODEL_DESIGN
-    if _use_2d_tp_sharding or _use_base_sharding:
-        ShardingAxisName = ShardingAxisNameBase
-    else:
-        ShardingAxisName = ShardingAxisName2D
-except Exception:
-    ShardingAxisName = ShardingAxisName2D
+def _get_sharding_axis_name_cls():
+    try:
+        if envs.USE_2D_TP or envs.NEW_MODEL_DESIGN:
+            return ShardingAxisNameBase
+    except Exception:
+        pass
+    return ShardingAxisName2D
+
+
+class _DynamicShardingAxisName:
+
+    def __getattr__(self, name):
+        return getattr(_get_sharding_axis_name_cls(), name)
+
+    def __dir__(self):
+        return sorted(
+            set(dir(ShardingAxisNameBase)) | set(dir(ShardingAxisName2D)))
+
+
+ShardingAxisName = _DynamicShardingAxisName()
 
 
 @dataclass

@@ -43,6 +43,9 @@ def mock_vllm_config():
     mock_parallel_conf.nnodes = 1
     mock_parallel_conf.nnodes_within_dp = 1
 
+    mock_scheduler_conf = MagicMock()
+    mock_scheduler_conf.max_num_seqs = 16
+
     mock_additional_config = {}
 
     # Create the main config mock and attach the others without a top-level spec
@@ -50,10 +53,12 @@ def mock_vllm_config():
     config.model_config = ModelConfig(model="Qwen/Qwen3-0.6B")
     config.cache_config = mock_cache_conf
     config.parallel_config = mock_parallel_conf
+    config.scheduler_config = mock_scheduler_conf
     config.additional_config = mock_additional_config
 
     config.sharding_config = MagicMock()
     config.sharding_config.total_devices = 2
+    config.sharding_config.total_dp_size = 1
 
     return config
 
@@ -174,6 +179,7 @@ class TestTPUWorker:
 
         expected_devices = ['tpu:0', 'tpu:1']  # Sliced by tensor_parallel_size
         assert worker.devices == expected_devices
+        mock_jax.devices.assert_any_call("tpu")
         expected_rank = 0
         expected_is_first_rank = True
         expected_is_last_rank = True
@@ -183,28 +189,221 @@ class TestTPUWorker:
                                                 expected_is_first_rank,
                                                 expected_is_last_rank)
 
+    @patch('tpu_inference.worker.tpu_worker.TPUModelRunner')
     @patch('tpu_inference.worker.tpu_worker.utils')
-    def test_determine_available_memory(self, mock_utils, mock_vllm_config):
+    @patch('tpu_inference.worker.tpu_worker.jax')
+    @patch('tpu_inference.worker.tpu_worker.ensure_kv_transfer_initialized')
+    def test_init_device_uses_tpu_local_devices_for_index_selection(
+            self, mock_ensure_kv_transfer_initialized, mock_jax, mock_utils,
+            mock_runner_cls, mock_vllm_config):
+        """Tests device index selection stays on the TPU backend."""
+        worker = TPUWorker(
+            vllm_config=mock_vllm_config,
+            local_rank=0,
+            rank=0,
+            distributed_init_method="test_method",
+            devices=[],
+        )
+        mock_vllm_config.sharding_config.device_indexes = [3, 1]
+        local_devices = []
+        for i in range(4):
+            device = MagicMock()
+            device.id = i
+            local_devices.append(device)
+        mock_jax.local_devices.return_value = local_devices
+        mock_jax.devices.return_value = local_devices
+
+        worker.init_device()
+
+        assert worker.devices == [local_devices[3], local_devices[1]]
+        mock_jax.local_devices.assert_any_call(backend="tpu")
+
+    @patch('tpu_inference.worker.tpu_worker.get_kv_cache_groups')
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory(self, mock_utils, mock_get_kv_groups,
+                                        mock_vllm_config):
         """Tests the available HBM memory calculation."""
         # Setup mock return for hbm_usage_bytes: [(used_bytes, limit_bytes), ...]
         mock_utils.hbm_usage_bytes.return_value = [
             (100 * 1024**3, 1000 * 1024**3), (200 * 1024**3, 1000 * 1024**3)
         ]
+        mock_utils.GBYTES = 1024**3
+        mock_get_kv_groups.return_value = []
         mock_devices = ['tpu:0', 'tpu:1']
         worker = TPUWorker(vllm_config=mock_vllm_config,
                            local_rank=0,
                            rank=0,
                            distributed_init_method="test_method",
                            devices=mock_devices)
+        worker.model_runner = MagicMock()
+        worker.model_runner.model_config.enforce_eager = False
+        worker.model_runner.compilation_manager._sampling_precompiled = False
+        worker.model_runner.compilation_manager._gather_logprobs_precompiled = False
 
         available_mem = worker.determine_available_memory()
 
         mock_utils.hbm_usage_bytes.assert_called_once_with(mock_devices)
+        worker.model_runner.compilation_manager._precompile_sampling.assert_called_once(
+        )
+        worker.model_runner.compilation_manager._precompile_gather_logprobs.assert_called_once(
+        )
         # Total limit: 1000 + 1000 = 2000 GiB
         # Total cap: 2000 * 0.9 = 1800 GiB
         # Total used: 100 + 200 = 300 GiB
         # Total free = 1800 - 300 = 1500 GiB
         expected_mem = 1500 * 1024**3
+        assert available_mem == expected_mem
+
+    @patch('tpu_inference.worker.tpu_worker.get_kv_cache_groups')
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_precompiles_before_measuring(
+            self, mock_utils, mock_get_kv_groups, mock_vllm_config):
+        mock_get_kv_groups.return_value = []
+        mock_utils.GBYTES = 1024**3
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=['tpu:0'])
+        worker.model_runner = MagicMock()
+        worker.model_runner.model_config.enforce_eager = False
+        worker.model_runner.compilation_manager._sampling_precompiled = False
+        worker.model_runner.compilation_manager._gather_logprobs_precompiled = False
+
+        call_order = []
+
+        def record_sampling():
+            call_order.append("sampling")
+
+        def record_logprobs():
+            call_order.append("logprobs")
+
+        def record_hbm_usage(_devices):
+            call_order.append("measure")
+            return [(100 * 1024**3, 1000 * 1024**3)]
+
+        worker.model_runner.compilation_manager._precompile_sampling.side_effect = record_sampling
+        worker.model_runner.compilation_manager._precompile_gather_logprobs.side_effect = record_logprobs
+        mock_utils.hbm_usage_bytes.side_effect = record_hbm_usage
+
+        worker.determine_available_memory()
+
+        assert call_order == ["sampling", "logprobs", "measure"]
+
+    @patch('tpu_inference.worker.tpu_worker.get_kv_cache_groups')
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_reserves_one_kv_tensor(
+            self, mock_utils, mock_get_kv_groups, mock_vllm_config):
+        mock_utils.hbm_usage_bytes.return_value = [
+            (100 * 1024**3, 1000 * 1024**3),
+            (200 * 1024**3, 1000 * 1024**3),
+        ]
+        mock_utils.GBYTES = 1024**3
+        mock_group = MagicMock()
+        mock_group.layer_names = ["layer.0", "layer.1", "layer.2", "layer.3"]
+        mock_get_kv_groups.return_value = [mock_group]
+
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=['tpu:0', 'tpu:1'])
+        worker.model_runner = MagicMock()
+        worker.model_runner.model_config.enforce_eager = False
+        worker.model_runner.compilation_manager._sampling_precompiled = False
+        worker.model_runner.compilation_manager._gather_logprobs_precompiled = False
+        worker.model_runner.max_num_reqs = 0
+        worker.vllm_config.sharding_config.attn_dp_size = 1
+        worker.vllm_config.scheduler_config.max_num_seqs = 0
+        worker.model_runner.get_kv_cache_spec.return_value = {
+            "layer.0": MagicMock(),
+            "layer.1": MagicMock(),
+            "layer.2": MagicMock(),
+            "layer.3": MagicMock(),
+        }
+
+        available_mem = worker.determine_available_memory()
+
+        raw_available = 1500 * 1024**3
+        expected_reserve = raw_available // 5
+        assert available_mem == raw_available - expected_reserve
+
+    @patch('tpu_inference.worker.tpu_worker.get_kv_cache_groups')
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_reserves_extra_headroom_for_attention_dp(
+            self, mock_utils, mock_get_kv_groups, mock_vllm_config):
+        mock_utils.hbm_usage_bytes.return_value = [
+            (100 * 1024**3, 1000 * 1024**3),
+            (200 * 1024**3, 1000 * 1024**3),
+        ]
+        mock_utils.GBYTES = 1024**3
+        mock_group = MagicMock()
+        mock_group.layer_names = ["layer.0", "layer.1", "layer.2", "layer.3"]
+        mock_get_kv_groups.return_value = [mock_group]
+
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=['tpu:0', 'tpu:1'])
+        worker.model_runner = MagicMock()
+        worker.model_runner.model_config.enforce_eager = False
+        worker.model_runner.compilation_manager._sampling_precompiled = False
+        worker.model_runner.compilation_manager._gather_logprobs_precompiled = False
+        worker.model_runner.max_num_reqs = 0
+        worker.vllm_config.sharding_config.attn_dp_size = 2
+        worker.vllm_config.scheduler_config.max_num_seqs = 0
+        worker.model_runner.get_kv_cache_spec.return_value = {
+            "layer.0": MagicMock(),
+            "layer.1": MagicMock(),
+            "layer.2": MagicMock(),
+            "layer.3": MagicMock(),
+        }
+
+        available_mem = worker.determine_available_memory()
+
+        raw_available = 1500 * 1024**3
+        expected_reserve = raw_available * 6 // 10
+        assert available_mem == raw_available - expected_reserve
+
+    @patch('tpu_inference.worker.tpu_worker.get_kv_cache_groups')
+    @patch('tpu_inference.worker.tpu_worker.utils')
+    def test_determine_available_memory_caps_to_scheduler_budget(
+            self, mock_utils, mock_get_kv_groups, mock_vllm_config):
+        mock_utils.hbm_usage_bytes.return_value = [
+            (100 * 1024**3, 1000 * 1024**3),
+            (200 * 1024**3, 1000 * 1024**3),
+        ]
+        mock_utils.GBYTES = 1024**3
+        mock_spec = MagicMock()
+        mock_spec.block_size = 128
+        mock_spec.page_size_bytes = 1024
+        mock_spec.max_memory_usage_bytes.return_value = 4096
+        mock_group = MagicMock()
+        mock_group.layer_names = ["layer.0", "layer.1", "layer.2", "layer.3"]
+        mock_group.kv_cache_spec = mock_spec
+        mock_get_kv_groups.return_value = [mock_group]
+
+        worker = TPUWorker(vllm_config=mock_vllm_config,
+                           local_rank=0,
+                           rank=0,
+                           distributed_init_method="test_method",
+                           devices=['tpu:0', 'tpu:1'])
+        worker.model_runner = MagicMock()
+        worker.model_runner.model_config.enforce_eager = False
+        worker.model_runner.compilation_manager._sampling_precompiled = False
+        worker.model_runner.compilation_manager._gather_logprobs_precompiled = False
+        worker.model_runner.max_num_reqs = 8
+        worker.model_runner.get_kv_cache_spec.return_value = {
+            "layer.0": mock_spec,
+            "layer.1": mock_spec,
+            "layer.2": mock_spec,
+            "layer.3": mock_spec,
+        }
+
+        available_mem = worker.determine_available_memory()
+
+        expected_mem = 4 * 8 * 1024 * 4
         assert available_mem == expected_mem
 
     #

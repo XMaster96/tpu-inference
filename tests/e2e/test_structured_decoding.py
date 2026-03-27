@@ -28,9 +28,14 @@ from __future__ import annotations
 from vllm import LLM, SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/"
+    "snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+)
+
 
 def test_structured_decoding():
-    llm = LLM(model='meta-llama/Llama-3.2-1B-Instruct',
+    llm = LLM(model=MODEL_NAME,
               max_model_len=1024,
               max_num_seqs=1,
               enable_prefix_caching=False)

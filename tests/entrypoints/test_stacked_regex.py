@@ -2,6 +2,7 @@
 
 import json
 import unittest
+from concurrent.futures import Future
 from http import HTTPStatus
 from types import SimpleNamespace
 
@@ -16,7 +17,14 @@ from vllm.entrypoints.openai.completion.protocol import (
 )
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse, UsageInfo
 from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import StructuredOutputsParams
+from vllm.config import StructuredOutputsConfig, VllmConfig
+from vllm.config.model import ModelConfig
+from vllm.config.parallel import ParallelConfig
 from vllm.sampling_params import SamplingParams
+from vllm.v1.request import Request
+import vllm.v1.structured_output as structured_output_module
+from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
 from tpu_inference.entrypoints import online_rl_server
@@ -414,6 +422,46 @@ class TestStackedRegexRoute(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(handler.requests, [])
         self.assertIn("guidance backend", body["error"]["message"])
+
+
+class TestStructuredOutputManagerPolicy(unittest.TestCase):
+
+    def test_tpu_forces_sync_grammar_compilation(self):
+        original_platform = structured_output_module.current_platform
+        structured_output_module.current_platform = SimpleNamespace(
+            is_tpu=lambda: True)
+        try:
+            vllm_config = VllmConfig(
+                model_config=ModelConfig(tokenizer="gpt2"),
+                structured_outputs_config=StructuredOutputsConfig(
+                    backend="guidance"),
+                parallel_config=ParallelConfig(distributed_executor_backend=None),
+            )
+            manager = StructuredOutputManager(vllm_config)
+
+            tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            prompt = tokenizer.encode('{"a": "b"}')
+            sampling_params = SamplingParams(
+                structured_outputs=StructuredOutputsParams(
+                    json='{"type": "object"}',
+                ),
+            )
+            sampling_params.structured_outputs._backend = "guidance"
+            request = Request(
+                "test_request_tpu_sync",
+                prompt_token_ids=prompt,
+                sampling_params=sampling_params,
+                pooling_params=None,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+            manager.grammar_init(request)
+
+            self.assertFalse(manager._use_async_grammar_compilation)
+            self.assertNotIsInstance(request.structured_output_request._grammar,
+                                     Future)
+        finally:
+            structured_output_module.current_platform = original_platform
 
 
 if __name__ == "__main__":

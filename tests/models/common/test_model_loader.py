@@ -173,6 +173,63 @@ def test_override_hf_config_from_modlax_orbax(vllm_config):
         assert hf_config.tie_word_embeddings is False
 
 
+def test_override_hf_config_from_modlax_orbax_preserves_yarn_scaling(
+        vllm_config):
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        with open(os.path.join(checkpoint_path, "_CHECKPOINT_METADATA"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(checkpoint_path, "model_config.yml"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write(
+                "\n".join([
+                    "dtype: bfloat16",
+                    "head_dim: 128",
+                    "hidden_act: silu",
+                    "hidden_size: 5120",
+                    "intermediate_size: 16384",
+                    "max_position_embeddings: 262144",
+                    "num_attention_heads: 32",
+                    "num_hidden_layers: 40",
+                    "num_key_value_heads: 8",
+                    "rope_theta: 1000000000.0",
+                    "rope_type: yarn",
+                    "rope_yarn_config:",
+                    "  factor: 16.0",
+                    "  original_max_position_embeddings: 16384.0",
+                    "  beta_fast: 32.0",
+                    "  beta_slow: 1.0",
+                    "  attention_factor: 1.25",
+                    "  mscale: 1.0",
+                    "  mscale_all_dim: 1.0",
+                    "  llama_4_scaling_beta: 0.1",
+                    "tie_word_embeddings: false",
+                    "attention_bias: false",
+                    "mlp_bias: false",
+                    "vocab_size: 131072",
+                ]))
+
+        vllm_config.model_config.model_weights = checkpoint_path
+        model_loader._maybe_override_hf_config_with_modlax_orbax(vllm_config,
+                                                                  False)
+        hf_config = vllm_config.model_config.hf_config
+
+        assert hf_config.rope_scaling is not None
+        assert hf_config.rope_scaling["rope_type"] == "yarn"
+        assert hf_config.rope_scaling["factor"] == 16.0
+        assert hf_config.rope_scaling["attention_factor"] == 1.25
+        assert hf_config.rope_scaling["attn_factor"] == 1.25
+        assert hf_config.rope_scaling["llama_4_scaling_beta"] == 0.1
+        assert hf_config.llama_4_scaling == {
+            "beta": 0.1,
+            "original_max_position_embeddings": 16384.0,
+        }
+
+
 def test_select_modlax_orbax_checkpoint_path_resolves_child(vllm_config):
     with tempfile.TemporaryDirectory() as checkpoint_dir:
         checkpoint_path = os.path.join(checkpoint_dir, "ckpt")

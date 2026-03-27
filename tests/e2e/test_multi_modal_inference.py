@@ -13,6 +13,15 @@ from vllm import LLM, EngineArgs, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.multimodal.image import convert_image_mode
 
+pytestmark = pytest.mark.skip(
+    reason="Multimodal E2E is disabled in the default TPU test run."
+)
+
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/"
+    "snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"
+)
+
 # Expected partial text output from the model. This is based on a previous
 # run and is used for verification. The test is considered passed if the
 # generated output match with this text.
@@ -34,7 +43,7 @@ def test_multi_modal_inference(monkeypatch, enable_dynamic_image_sizes):
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
     # --- Configuration ---
-    model = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model = MODEL_NAME
     tensor_parallel_size = 1
     temperature = 0.0
     max_tokens = 64

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import copy
 import importlib
 import inspect
 from argparse import Namespace
@@ -66,6 +65,15 @@ from tpu_inference.entrypoints.stacked_regex import (
     normalize_completion_request,
 )
 from tpu_inference.models.jax.utils.weight_utils import _is_modlax_orbax_checkpoint
+from tpu_inference.vllm_runtime_patches import (
+    apply_vllm_runtime_patches,
+    filter_scheduler_output_missing_req_indices as _shared_filter_scheduler_output_missing_req_indices,
+    get_reload_generation as _shared_get_reload_generation,
+    is_stale_scheduler_output as _shared_is_stale_scheduler_output,
+    mark_scheduler_output_reload_generation as _shared_mark_scheduler_output_reload_generation,
+    patch_async_scheduler_preempt_discard as _shared_patch_async_scheduler_preempt_discard,
+    patch_scheduler_reload_stale_output as _shared_patch_scheduler_reload_stale_output,
+)
 
 logger = init_logger("tpu_inference.entrypoints.online_rl_server")
 
@@ -97,140 +105,45 @@ def _weights_ready(app_state) -> bool:
     return (not app_state.require_first_reload) or app_state.first_weights_loaded.is_set()
 
 
+def _get_request_admission_lock(app_state) -> asyncio.Lock:
+    lock = getattr(app_state, "request_admission_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app_state.request_admission_lock = lock
+    return lock
+
+
+def _install_request_admission_gate(app_state, engine: EngineClient) -> asyncio.Lock:
+    lock = _get_request_admission_lock(app_state)
+    setattr(engine, "_tpu_reload_request_gate", lock)
+    return lock
+
+
 def _get_reload_generation(scheduler) -> int:
-    return int(getattr(scheduler, "_tpu_reload_generation", 0))
+    return _shared_get_reload_generation(scheduler)
 
 
 def _mark_scheduler_output_reload_generation(scheduler, scheduler_output) -> None:
-    setattr(
-        scheduler_output,
-        "_tpu_reload_generation",
-        _get_reload_generation(scheduler),
-    )
+    _shared_mark_scheduler_output_reload_generation(scheduler, scheduler_output)
 
 
 def _is_stale_scheduler_output(scheduler, scheduler_output) -> bool:
-    output_generation = getattr(scheduler_output, "_tpu_reload_generation", None)
-    if output_generation is None:
-        return False
-    return int(output_generation) != _get_reload_generation(scheduler)
+    return _shared_is_stale_scheduler_output(scheduler, scheduler_output)
 
 
 def _filter_scheduler_output_missing_req_indices(scheduler_output, model_runner_output):
-    req_id_to_index = getattr(model_runner_output, "req_id_to_index", {}) or {}
-    num_scheduled_tokens = dict(
-        getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+    return _shared_filter_scheduler_output_missing_req_indices(
+        scheduler_output,
+        model_runner_output,
     )
-    missing_req_ids = tuple(
-        req_id for req_id in num_scheduled_tokens if req_id not in req_id_to_index
-    )
-    if not missing_req_ids:
-        return scheduler_output, ()
-
-    filtered_output = copy.copy(scheduler_output)
-    filtered_output.num_scheduled_tokens = {
-        req_id: num_tokens
-        for req_id, num_tokens in num_scheduled_tokens.items()
-        if req_id in req_id_to_index
-    }
-    filtered_output.scheduled_spec_decode_tokens = {
-        req_id: token_ids
-        for req_id, token_ids in getattr(
-            scheduler_output, "scheduled_spec_decode_tokens", {}
-        ).items()
-        if req_id in req_id_to_index
-    }
-    return filtered_output, missing_req_ids
 
 
 def _patch_async_scheduler_preempt_discard() -> None:
-    """Patch AsyncScheduler to avoid discarding valid post-reload tokens.
-
-    vLLM marks force-preempted requests with ``discard_latest_async_tokens``.
-    If the output loop is already quiesced before preemption, there is no stale
-    in-flight token to drop. Discarding the next token in that case can desync
-    strict structured-output requests across live reload.
-    """
-    try:
-        from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-        from vllm.v1.request import RequestStatus
-    except Exception:
-        return
-
-    if getattr(AsyncScheduler, "_tpu_preempt_discard_patch_installed", False):
-        return
-
-    original_update_with_output = AsyncScheduler._update_request_with_output
-
-    def _patched_update_request_with_output(self, request, new_token_ids):
-        if (
-            getattr(request, "discard_latest_async_tokens", False)
-            and getattr(request, "status", None) == RequestStatus.RUNNING
-        ):
-            request.discard_latest_async_tokens = False
-        return original_update_with_output(self, request, new_token_ids)
-
-    AsyncScheduler._update_request_with_output = _patched_update_request_with_output
-    AsyncScheduler._tpu_preempt_discard_patch_installed = True
+    _shared_patch_async_scheduler_preempt_discard()
 
 
 def _patch_scheduler_reload_stale_output() -> None:
-    """Patch Scheduler to drop model outputs invalidated by live reload preemption."""
-    try:
-        from vllm.v1.core.sched.scheduler import Scheduler
-    except Exception:
-        return
-
-    if getattr(Scheduler, "_tpu_reload_stale_output_patch_installed", False):
-        return
-
-    original_schedule = Scheduler.schedule
-    original_reset_prefix_cache = Scheduler.reset_prefix_cache
-    original_update_from_output = Scheduler.update_from_output
-
-    def _patched_schedule(self, *args, **kwargs):
-        scheduler_output = original_schedule(self, *args, **kwargs)
-        _mark_scheduler_output_reload_generation(self, scheduler_output)
-        return scheduler_output
-
-    def _patched_reset_prefix_cache(self, *args, **kwargs):
-        reset_running_requests = bool(kwargs.get("reset_running_requests", False))
-        if args:
-            reset_running_requests = bool(args[0])
-        reset_ok = original_reset_prefix_cache(self, *args, **kwargs)
-        if reset_running_requests and reset_ok:
-            self._tpu_reload_generation = _get_reload_generation(self) + 1
-        return reset_ok
-
-    def _patched_update_from_output(self, scheduler_output, model_runner_output):
-        if _is_stale_scheduler_output(self, scheduler_output):
-            stale_req_ids = tuple(
-                getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
-            )
-            if stale_req_ids:
-                logger.warning(
-                    "Dropping stale scheduler output after live reload preemption "
-                    "for request ids: %s",
-                    stale_req_ids,
-                )
-            return {}
-
-        filtered_output, missing_req_ids = _filter_scheduler_output_missing_req_indices(
-            scheduler_output,
-            model_runner_output,
-        )
-        if missing_req_ids:
-            logger.warning(
-                "Dropping stale model output entries missing request indices "
-                "after live reload preemption for request ids: %s",
-                missing_req_ids,
-            )
-        return original_update_from_output(self, filtered_output, model_runner_output)
-
-    Scheduler.schedule = _patched_schedule
-    Scheduler.reset_prefix_cache = _patched_reset_prefix_cache
-    Scheduler.update_from_output = _patched_update_from_output
-    Scheduler._tpu_reload_stale_output_patch_installed = True
+    _shared_patch_scheduler_reload_stale_output()
 
 
 def _ensure_pause_controls_supported(engine: EngineClient) -> None:
@@ -418,70 +331,65 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
     used_pause_generation = False
 
     async with app_state.reload_lock:
-        try:
-            if payload.wait_for_inflight_requests:
-                await engine.pause_generation(
-                    wait_for_inflight_requests=True,
-                    clear_cache=payload.clear_cache,
-                )
-                used_pause_generation = True
-            else:
-                _ensure_pause_controls_supported(engine)
-                manual_pause_mode = True
-                was_paused = await _set_generation_paused(engine, True)
-                should_unpause_manually = not was_paused
-                if not payload.clear_cache:
-                    logger.warning(
-                        "reload_weights called with wait_for_inflight_requests=false "
-                        "and clear_cache=false; forcing prefix-cache reset with "
-                        "request preemption to preserve inflight correctness."
+        async with _get_request_admission_lock(app_state):
+            try:
+                if payload.wait_for_inflight_requests:
+                    await engine.pause_generation(
+                        wait_for_inflight_requests=True,
+                        clear_cache=payload.clear_cache,
                     )
+                    used_pause_generation = True
+                else:
+                    _ensure_pause_controls_supported(engine)
+                    manual_pause_mode = True
+                    was_paused = await _set_generation_paused(engine, True)
+                    should_unpause_manually = not was_paused
 
-                # Invalidate any async TPU decode state before preempting so
-                # stale in-flight outputs are dropped at the reload boundary.
-                await _invalidate_live_reload_worker_state(
-                    engine,
-                    timeout_seconds=payload.timeout_seconds,
+                    # Invalidate any async TPU decode state before preempting so
+                    # stale in-flight outputs are dropped at the reload boundary.
+                    await _invalidate_live_reload_worker_state(
+                        engine,
+                        timeout_seconds=payload.timeout_seconds,
+                    )
+                    # Preempt running requests instead of aborting them. This keeps
+                    # per-request state (including structured-output FSM progression)
+                    # while forcing KV recomputation under the new weights.
+                    await _preempt_running_requests(engine)
+
+                rpc_args = (
+                    (payload.checkpoint_path,)
+                    if payload.checkpoint_path is not None
+                    else ()
                 )
-                # Preempt running requests instead of aborting them. This keeps
-                # per-request state (including structured-output FSM progression)
-                # while forcing KV recomputation under the new weights.
-                await _preempt_running_requests(engine)
-
-            rpc_args = (
-                (payload.checkpoint_path,)
-                if payload.checkpoint_path is not None
-                else ()
-            )
-            worker_results = await engine.collective_rpc(
-                method="reload_model_weights",
-                timeout=payload.timeout_seconds,
-                args=rpc_args,
-                kwargs={"release_kv_cache": payload.release_kv_cache},
-            )
-
-            if manual_pause_mode:
-                await _invalidate_live_reload_worker_state(
-                    engine,
-                    timeout_seconds=payload.timeout_seconds,
+                worker_results = await engine.collective_rpc(
+                    method="reload_model_weights",
+                    timeout=payload.timeout_seconds,
+                    args=rpc_args,
+                    kwargs={"release_kv_cache": payload.release_kv_cache},
                 )
-                # Re-preempt after reload so request scheduler state stays
-                # consistent with freshly reinitialized worker KV caches.
-                await _preempt_running_requests(engine)
-                if payload.clear_cache:
-                    await engine.reset_mm_cache()
-        except Exception as exc:
-            logger.exception("Live model reload failed")
-            raise HTTPException(
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
-                detail=f"Live model reload failed: {exc}",
-            ) from exc
-        finally:
-            if manual_pause_mode:
-                if should_unpause_manually:
-                    await _set_generation_paused(engine, False)
-            elif used_pause_generation:
-                await engine.resume_generation()
+
+                if manual_pause_mode:
+                    await _invalidate_live_reload_worker_state(
+                        engine,
+                        timeout_seconds=payload.timeout_seconds,
+                    )
+                    # Re-preempt after reload so request scheduler state stays
+                    # consistent with freshly reinitialized worker KV caches.
+                    await _preempt_running_requests(engine)
+                    if payload.clear_cache:
+                        await engine.reset_mm_cache()
+            except Exception as exc:
+                logger.exception("Live model reload failed")
+                raise HTTPException(
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    detail=f"Live model reload failed: {exc}",
+                ) from exc
+            finally:
+                if manual_pause_mode:
+                    if should_unpause_manually:
+                        await _set_generation_paused(engine, False)
+                elif used_pause_generation:
+                    await engine.resume_generation()
 
         if payload.checkpoint_path is not None:
             app_state.current_checkpoint_path = payload.checkpoint_path
@@ -620,8 +528,7 @@ def build_minimal_app(args: Namespace) -> FastAPI:
 
 async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     decorate_logs("OnlineRLServer")
-    _patch_async_scheduler_preempt_discard()
-    _patch_scheduler_reload_stale_output()
+    apply_vllm_runtime_patches()
     install_staged_guidance_patch()
     require_first_reload, checkpoint_path = _configure_initial_reload_mode(args)
 
@@ -647,6 +554,7 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
         if not require_first_reload:
             app.state.first_weights_loaded.set()
         app.state.reload_lock = asyncio.Lock()
+        _install_request_admission_gate(app.state, client)
 
         logger.info(
             "Starting online RL TPU server on %s (require_first_reload=%s)",

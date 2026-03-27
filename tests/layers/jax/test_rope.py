@@ -17,6 +17,7 @@ from jax import numpy as jnp
 from jax._src import test_util as jtu
 from jax.sharding import Mesh
 
+from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.layers.jax.rope import (DeepseekScalingRotaryEmbedding,
                                            RotaryEmbedding)
 
@@ -91,3 +92,28 @@ class DeepseekScalingRotaryEmbeddingTest(jtu.JaxTestCase):
             dtype=jnp.float32)
         self.assertTrue(x_rope.shape == x.shape)
         self.assertArraysAllClose(x_rope, expected_x_rope)
+
+
+class RopeInterfaceTest(jtu.JaxTestCase):
+
+    def test_apply_rope_supports_yarn_attention_factor(self):
+        inputs = jnp.ones((2, 1, 2), dtype=jnp.float32)
+        positions = jnp.arange(2, dtype=jnp.int32)
+        rope_scaling = {
+            "rope_type": "yarn",
+            "type": "yarn",
+            "factor": 2.0,
+            "original_max_position_embeddings": 1.0,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "attention_factor": 1.5,
+        }
+
+        outputs = apply_rope(inputs,
+                             positions,
+                             head_dim=2,
+                             rope_theta=10000.0,
+                             rope_scaling=rope_scaling)
+
+        expected_first_token = jnp.array([[1.5, 1.5]], dtype=jnp.float32)
+        self.assertArraysAllClose(outputs[0], expected_first_token)

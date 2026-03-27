@@ -16,9 +16,13 @@ from vllm.distributed.parallel_state import (ensure_model_parallel_initialized,
                                              init_distributed_environment)
 from vllm.lora.request import LoRARequest
 from vllm.tasks import SupportedTask
+from vllm.utils.math_utils import cdiv
 from vllm.v1 import utils as vllm_utils
+from vllm.v1.core.kv_cache_utils import (get_kv_cache_groups,
+                                         get_uniform_page_size)
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.kv_cache_interface import (KVCacheConfig, KVCacheSpec,
+                                        UniformTypeKVCacheSpecs)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 
 from tpu_inference import envs, utils
@@ -31,8 +35,18 @@ from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.vllm_runtime_patches import apply_vllm_runtime_patches
 
 logger = init_logger(__name__)
+apply_vllm_runtime_patches()
+
+
+def _get_tpu_devices():
+    return jax.devices("tpu")
+
+
+def _get_local_tpu_devices():
+    return jax.local_devices(backend="tpu")
 
 
 @dataclass
@@ -172,7 +186,7 @@ class TPUWorker:
             device_indexes = sharding_config.device_indexes
             if device_indexes is not None and len(device_indexes) > 0:
                 # Enforcing the devices sequence to be consistent with the specified device indexes
-                all_local_devices = jax.local_devices()
+                all_local_devices = _get_local_tpu_devices()
                 device_dict = {
                     device.id: device
                     for device in all_local_devices
@@ -193,15 +207,15 @@ class TPUWorker:
                     # We only support a mixed tp + pp scenario that tp size is
                     #  smaller or equals the total TPUs in one node
                     # say: we have 4 nodes with 4 TPUs each, we can only do pp:4, tp:4, but not pp:2, tp:8
-                    assert jax.local_device_count(
-                    ) >= sharding_config.total_devices
-                    self.devices = jax.local_devices()[:sharding_config.
-                                                       total_devices]
+                    local_tpu_devices = _get_local_tpu_devices()
+                    assert len(local_tpu_devices) >= sharding_config.total_devices
+                    self.devices = local_tpu_devices[:sharding_config.
+                                                     total_devices]
                 else:
                     # In a multi-host distributed env, say: Ray, local_device count may smaller
                     # than the total devices, we just choose the smaller set here.
-                    self.devices = jax.devices()[:sharding_config.
-                                                 total_devices]
+                    self.devices = _get_tpu_devices()[:sharding_config.
+                                                      total_devices]
 
         # Initialize the vLLM distribution layer as a single chip environment,
         # we'll swap the model's parallel modules with TPU SPMD equivalents.
@@ -239,7 +253,7 @@ class TPUWorker:
             # mapping between P/D workers
             if multihost_backend == "ray":
                 self.topology_order_id = get_device_topology_order_id(
-                    jax.local_devices(), jax.devices())
+                    _get_local_tpu_devices(), _get_tpu_devices())
 
         self.model_runner = TPUModelRunner(self.vllm_config, self.devices,
                                            self.rank, is_first_rank,
@@ -252,8 +266,8 @@ class TPUWorker:
                     f"is_driver_worker={self.is_driver_worker} | "
                     f"hbm={utils.hbm_usage_gb(self.devices)}GiB |"
                     f"self.devices={self.devices} | "
-                    f"total devices={jax.devices()} | "
-                    f"local_devices={jax.local_devices()}")
+                    f"total devices={_get_tpu_devices()} | "
+                    f"local_devices={_get_local_tpu_devices()}")
         vllm_utils.report_usage_stats(self.vllm_config)
 
     def initialize_pp_transfer_connect(self):
@@ -263,6 +277,7 @@ class TPUWorker:
                                    self.rank - 1)
 
     def determine_available_memory(self) -> int:
+        self._precompile_kv_cache_dependencies()
         gpu_memory_utilization = self.cache_config.gpu_memory_utilization
         hbm_usage = utils.hbm_usage_bytes(self.devices)
         total_hbm_limit = total_hbm_used = 0
@@ -272,16 +287,28 @@ class TPUWorker:
 
         total_hbm_limit_cap = total_hbm_limit * gpu_memory_utilization
         total_hbm_avail = int(total_hbm_limit_cap - total_hbm_used)
+        kv_cache_alloc_reserve = self._get_kv_cache_allocation_reserve(
+            total_hbm_avail)
+        total_hbm_avail -= kv_cache_alloc_reserve
+        scheduler_kv_cache_budget = self._get_scheduler_kv_cache_budget()
+        if scheduler_kv_cache_budget > 0:
+            total_hbm_avail = min(total_hbm_avail, scheduler_kv_cache_budget)
 
         total_hbm_limit_gb = round(total_hbm_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(total_hbm_limit_cap / utils.GBYTES, 2)
         total_hbm_used_gb = round(total_hbm_used / utils.GBYTES, 2)
         total_hbm_avail_gb = round(total_hbm_avail / utils.GBYTES, 2)
+        kv_cache_alloc_reserve_gb = round(kv_cache_alloc_reserve / utils.GBYTES,
+                                          2)
+        scheduler_kv_cache_budget_gb = round(
+            scheduler_kv_cache_budget / utils.GBYTES, 2)
 
         logger.info(f"Memory statistics | "
                     f"{total_hbm_limit_gb=}GiB | "
                     f"{total_hbm_limit_cap_gb=}GiB | "
                     f"{total_hbm_used_gb=}GiB | "
+                    f"{kv_cache_alloc_reserve_gb=}GiB | "
+                    f"{scheduler_kv_cache_budget_gb=}GiB | "
                     f"{total_hbm_avail_gb=}GiB")
 
         if total_hbm_avail <= 0:
@@ -291,6 +318,90 @@ class TPUWorker:
                              f"increasing --gpu-memory-utilization from "
                              f"{gpu_memory_utilization} to a larger value.")
         return total_hbm_avail
+
+    def _precompile_kv_cache_dependencies(self) -> None:
+        """Precompile TPU sampling kernels before sizing the KV cache.
+
+        The TPU worker allocates KV cache after these subgraphs are compiled in
+        initialize_from_config(). Run the same precompile step before memory
+        profiling so the cache planner sees the post-compile HBM footprint.
+        """
+        if not (envs.SKIP_JAX_PRECOMPILE or
+                (hasattr(self.model_runner.model_config, "enforce_eager")
+                 and self.model_runner.model_config.enforce_eager)):
+            compilation_manager = self.model_runner.compilation_manager
+            if not compilation_manager._sampling_precompiled:
+                compilation_manager._precompile_sampling()
+            if not compilation_manager._gather_logprobs_precompiled:
+                compilation_manager._precompile_gather_logprobs()
+
+    def _get_kv_cache_allocation_reserve(self, available_hbm: int) -> int:
+        """Reserve headroom for one in-flight KV tensor allocation.
+
+        TPU KV cache tensors are allocated sequentially. During each JAX
+        allocation, the runtime briefly needs enough room for the new tensor
+        before the allocation settles into its final sharded footprint. Reserve
+        roughly one tensor's worth of memory so the last layer does not OOM
+        even when the steady-state cache size fits. Attention-DP needs a larger
+        cushion because the allocator fragments more aggressively on v4/v5e.
+        """
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config,
+                                              self.get_kv_cache_spec())
+        if not kv_cache_groups:
+            return 0
+        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        if group_size <= 0:
+            return 0
+        attn_dp_size = getattr(self.vllm_config.sharding_config, "attn_dp_size",
+                               1)
+        if not isinstance(attn_dp_size, int):
+            attn_dp_size = 1
+        reserve_tensors = 6 if attn_dp_size > 1 else 1
+        return available_hbm * reserve_tensors // (group_size + reserve_tensors)
+
+    def _get_scheduler_kv_cache_budget(self) -> int:
+        """Cap KV cache sizing to the runner's maximum schedulable blocks."""
+        kv_cache_groups = get_kv_cache_groups(self.vllm_config,
+                                              self.get_kv_cache_spec())
+        if not kv_cache_groups:
+            return 0
+
+        max_num_reqs = getattr(self.model_runner, "max_num_reqs", None)
+        if not isinstance(max_num_reqs, int) or max_num_reqs <= 0:
+            scheduler_config = getattr(self.vllm_config, "scheduler_config",
+                                       None)
+            max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+            total_dp_size = getattr(self.vllm_config.sharding_config,
+                                    "total_dp_size", 1)
+            if (not isinstance(max_num_seqs, int) or max_num_seqs <= 0
+                    or not isinstance(total_dp_size, int)
+                    or total_dp_size <= 0):
+                return 0
+            max_num_reqs = max_num_seqs * total_dp_size
+
+        if len(kv_cache_groups) == 1 and isinstance(
+                kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs):
+            per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
+            max_blocks_per_req = max(
+                cdiv(spec.max_memory_usage_bytes(self.vllm_config),
+                     spec.page_size_bytes) for spec in per_layer_specs.values())
+            required_num_blocks = max_blocks_per_req * max_num_reqs
+            return sum(
+                spec.page_size_bytes * required_num_blocks
+                for spec in per_layer_specs.values())
+
+        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        if group_size <= 0:
+            return 0
+        page_size = get_uniform_page_size(
+            [group.kv_cache_spec for group in kv_cache_groups])
+        max_blocks_per_req = max(
+            cdiv(group.kv_cache_spec.max_memory_usage_bytes(self.vllm_config),
+                 group.kv_cache_spec.page_size_bytes)
+            for group in kv_cache_groups)
+        required_num_blocks = (max_blocks_per_req * max_num_reqs *
+                               len(kv_cache_groups))
+        return required_num_blocks * page_size * group_size
 
     def execute_model(
         self,
@@ -398,12 +509,7 @@ class TPUWorker:
         kv_cache_config: KVCacheConfig,
     ) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-        # Precompile functions with large vocab_size tensors before allocating KV cache to avoid OOM
-        if not (envs.SKIP_JAX_PRECOMPILE or
-                (hasattr(self.model_runner.model_config, "enforce_eager")
-                 and self.model_runner.model_config.enforce_eager)):
-            self.model_runner.compilation_manager._precompile_sampling()
-            self.model_runner.compilation_manager._precompile_gather_logprobs()
+        self._precompile_kv_cache_dependencies()
         self.model_runner.initialize_kv_cache(kv_cache_config,
                                               self.topology_order_id)
 

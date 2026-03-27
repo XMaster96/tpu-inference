@@ -12,6 +12,13 @@ from vllm import LLM, EngineArgs, SamplingParams
 
 from tpu_inference.core.core_tpu import DisaggEngineCore, DisaggEngineCoreProc
 
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/"
+    "models--Qwen--Qwen2.5-1.5B-Instruct/"
+    "snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+)
+DISAGG_SLICE_TP_SIZE = 2
+
 
 @pytest.fixture
 def test_prompts():
@@ -71,22 +78,20 @@ def test_disaggregated_serving(test_prompts, sampling_params):
     Test disaggregated serving end-to-end.
 
     Equivalent to:
-    PREFILL_SLICES=4 DECODE_SLICES=4 python examples/offline_inference.py \
-        --model=meta-llama/Meta-Llama-3.1-8B-Instruct --task=generate \
-        --max_model_len=2048 --tensor_parallel_size 4
+    PREFILL_SLICES=2 DECODE_SLICES=2 python examples/offline_inference.py \
+        --model=<cached Qwen2.5-1.5B-Instruct> --task=generate \
+        --max_model_len=2048 --tensor_parallel_size 2
     """
     # Set environment variables for disaggregated serving
-    # Using 4 slices for prefill and 4 for decode as requested
-    # Note: The user example used PREFILL_SLICES=4 DECODE_SLICES=4
-    # But usually slices are specified as "2x2" or similar if they are TPU topology.
-    # However, disagg_utils.py _parse_slices handles "4" as well (1D).
-    # We will stick to the user's example values.
+    # On a 4-chip machine the split must satisfy prefill + decode <= 4.
+    # Use an even 2+2 partition so the test exercises disagg without asking for
+    # more chips than the host actually has.
 
     # We need to mock the environment variables for this test
     with patch.dict(
             os.environ, {
-                "PREFILL_SLICES": "4",
-                "DECODE_SLICES": "4",
+                "PREFILL_SLICES": "2",
+                "DECODE_SLICES": "2",
                 "SKIP_JAX_PRECOMPILE": "1",
                 "VLLM_XLA_CHECK_RECOMPILATION": "0"
             }):
@@ -94,12 +99,12 @@ def test_disaggregated_serving(test_prompts, sampling_params):
         with patch("vllm.v1.engine.core.EngineCore", DisaggEngineCore), \
              patch("vllm.v1.engine.core.EngineCoreProc", DisaggEngineCoreProc):
 
-            model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+            model_name = MODEL_NAME
             os.system(f"rm -rf {vllm_envs.VLLM_XLA_CACHE_PATH}/*")
             engine_args = EngineArgs(
                 model=model_name,
                 max_model_len=2048,
-                tensor_parallel_size=4,
+                tensor_parallel_size=DISAGG_SLICE_TP_SIZE,
                 gpu_memory_utilization=0.90,
                 enforce_eager=False,
             )
@@ -126,10 +131,10 @@ def test_disaggregated_serving(test_prompts, sampling_params):
 def _run_inference(model_name: str,
                    test_prompts: list,
                    sampling_params: SamplingParams,
-                   tensor_parallel_size: int = 1,
+                   tensor_parallel_size: int = DISAGG_SLICE_TP_SIZE,
                    is_disagg: bool = False,
-                   prefill_slices: str = "4",
-                   decode_slices: str = "4") -> list:
+                   prefill_slices: str = "2",
+                   decode_slices: str = "2") -> list:
     """Helper function to run inference with specified configuration."""
 
     # Define the inner execution logic
@@ -178,20 +183,18 @@ def test_disaggregated_serving_correctness(test_prompts, sampling_params):
     """
     Test that disaggregated serving produces consistent results compared to a baseline.
     """
-    model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+    model_name = MODEL_NAME
     # Use a smaller subset of prompts for correctness testing
     small_prompts = test_prompts[:20]
     sampling_params.max_tokens = 16
 
-    # Run baseline (standard execution)
-    # We use tensor_parallel_size=4 to match the disagg resources if we assume
-    # the user has enough chips, or if we are just mocking.
-    # Since the original test used tp=4, we stick to it.
+    # Run baseline (standard execution) with the same per-engine TP size the
+    # disaggregated prefill/decode slices will actually use on a 2+2 split.
     print("Running Baseline Inference...")
     baseline_outputs = _run_inference(model_name=model_name,
                                       test_prompts=small_prompts,
                                       sampling_params=sampling_params,
-                                      tensor_parallel_size=4,
+                                      tensor_parallel_size=DISAGG_SLICE_TP_SIZE,
                                       is_disagg=False)
 
     # Run disaggregated inference
@@ -201,57 +204,43 @@ def test_disaggregated_serving_correctness(test_prompts, sampling_params):
     disagg_outputs = _run_inference(model_name=model_name,
                                     test_prompts=small_prompts,
                                     sampling_params=sampling_params,
-                                    tensor_parallel_size=4,
+                                    tensor_parallel_size=DISAGG_SLICE_TP_SIZE,
                                     is_disagg=True,
-                                    prefill_slices="4",
-                                    decode_slices="4")
+                                    prefill_slices="2",
+                                    decode_slices="2")
 
-    # Compare outputs
     assert len(baseline_outputs) == len(disagg_outputs)
 
     text_matches = 0
     text_mismatches = 0
     token_mismatches = 0
 
-    for i, (baseline,
-            disagg) in enumerate(zip(baseline_outputs, disagg_outputs)):
+    for i, (baseline, disagg) in enumerate(zip(baseline_outputs,
+                                               disagg_outputs)):
         baseline_text = baseline.outputs[0].text.strip()
         disagg_text = disagg.outputs[0].text.strip()
 
-        # Check text output
         if baseline_text == disagg_text:
             text_matches += 1
         else:
             text_mismatches += 1
             print(f"Text mismatch found in prompt {i}:")
             print(f"  Baseline: {baseline_text}")
-            print(f"  Disagg:   {disagg_text}")
+            print(f"  Disagg: {disagg_text}")
 
-        # Check log probabilities (tokens) if available
-        baseline_logprobs = baseline.outputs[0].logprobs
-        disagg_logprobs = disagg.outputs[0].logprobs
+        baseline_tokens = baseline.outputs[0].token_ids
+        disagg_tokens = disagg.outputs[0].token_ids
+        if baseline_tokens != disagg_tokens:
+            token_mismatches += 1
+            print(f"Token mismatch found in prompt {i}:")
+            print(f"  Baseline: {baseline_tokens}")
+            print(f"  Disagg: {disagg_tokens}")
 
-        if baseline_logprobs is not None and disagg_logprobs is not None:
-            assert len(baseline_logprobs) == len(disagg_logprobs), \
-                f"Logprobs length mismatch: {len(baseline_logprobs)} vs {len(disagg_logprobs)}"
-
-            for token_idx, (base_lp, disagg_lp) in enumerate(
-                    zip(baseline_logprobs, disagg_logprobs)):
-                if base_lp and disagg_lp:
-                    # Compare the top token IDs
-                    base_top_token = list(base_lp.keys())[0]
-                    disagg_top_token = list(disagg_lp.keys())[0]
-
-                    if base_top_token != disagg_top_token:
-                        token_mismatches += 1
-                        print(
-                            f"Token mismatch in prompt {i}, token {token_idx}:"
-                        )
-                        print(f"  Baseline: {base_top_token}")
-                        print(f"  Disagg:   {disagg_top_token}")
-
-    print("✓ Correctness test results:")
+    print("✓ Disaggregated correctness test results:")
     print(f"  Text: {text_matches} matches, {text_mismatches} mismatches")
-    print(f"  Token mismatches in logprobs: {token_mismatches}")
-    assert text_mismatches <= 5, f"Found {text_mismatches} text mismatches"
-    assert token_mismatches <= 40, f"Found {token_mismatches} token mismatches"
+    print(f"  Token mismatches: {token_mismatches}")
+
+    text_match_rate = text_matches / len(baseline_outputs)
+    assert text_match_rate >= 0.8, f"Text match rate {text_match_rate:.2%} is too low"
+    assert token_mismatches <= 4, (
+        f"Too many token-level mismatches: {token_mismatches}/{len(baseline_outputs)}")

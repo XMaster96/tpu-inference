@@ -29,12 +29,17 @@ from __future__ import annotations
 import pytest
 from vllm import LLM, SamplingParams
 
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/"
+    "snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+)
+
 
 @pytest.fixture(scope="module")
 def llm():
     """Create a shared LLM instance for all tests in this module."""
     return LLM(
-        model='meta-llama/Llama-3.2-1B-Instruct',
+        model=MODEL_NAME,
         max_model_len=1024,
         max_num_seqs=4,
         enable_prefix_caching=False,

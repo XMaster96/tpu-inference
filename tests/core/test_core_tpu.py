@@ -508,6 +508,34 @@ class TestDisaggOrchestrator(unittest.TestCase):
         self.mock_prefill_engine.shutdown.assert_called_once()
         self.mock_decode_engine.shutdown.assert_called_once()
 
+class TestDisaggEngineCorePrefixCache(unittest.TestCase):
+
+    def test_reset_prefix_cache_forwards_flags(self):
+        """Tests that reset_prefix_cache forwards flags to all schedulers."""
+        prefill_engine = MagicMock()
+        decode_engine = MagicMock()
+        prefill_engine.scheduler.reset_prefix_cache.return_value = True
+        decode_engine.scheduler.reset_prefix_cache.return_value = False
+
+        core = DisaggEngineCore.__new__(DisaggEngineCore)
+        core._prefill_engines = [prefill_engine]
+        core._decode_engines = [decode_engine]
+
+        result = core.reset_prefix_cache(
+            reset_running_requests=True,
+            reset_connector=False,
+        )
+
+        prefill_engine.scheduler.reset_prefix_cache.assert_called_once_with(
+            reset_running_requests=True,
+            reset_connector=False,
+        )
+        decode_engine.scheduler.reset_prefix_cache.assert_called_once_with(
+            reset_running_requests=True,
+            reset_connector=False,
+        )
+        self.assertFalse(result)
+
 
 if __name__ == '__main__':
     unittest.main()

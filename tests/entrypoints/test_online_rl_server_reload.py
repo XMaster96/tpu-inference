@@ -26,6 +26,7 @@ class _FakeEngine:
         initial_paused: bool = False,
         reset_prefix_cache_result: bool = True,
         collective_exc: Exception | None = None,
+        collective_exc_by_method: dict[str, Exception] | None = None,
         pause_exc: Exception | None = None,
     ):
         self._pause_cond = asyncio.Condition()
@@ -40,6 +41,7 @@ class _FakeEngine:
 
         self._reset_prefix_cache_result = reset_prefix_cache_result
         self._collective_exc = collective_exc
+        self._collective_exc_by_method = collective_exc_by_method or {}
         self._pause_exc = pause_exc
 
     async def pause_generation(self, **kwargs):
@@ -62,6 +64,10 @@ class _FakeEngine:
 
     async def collective_rpc(self, **kwargs):
         self.collective_calls.append(kwargs)
+        method = kwargs.get("method")
+        exc = self._collective_exc_by_method.get(method)
+        if exc is not None:
+            raise exc
         if self._collective_exc is not None:
             raise self._collective_exc
         return [{"status": "ok"}]
@@ -174,6 +180,7 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
             first_weights_loaded=asyncio.Event(),
             require_first_reload=False,
         )
+        online_rl_server._install_request_admission_gate(app_state, engine)
         return app_state, _FakeRawRequest(app_state)
 
     async def test_preempt_mode_uses_reset_running_requests(self):
@@ -206,12 +213,19 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine._paused)
         self.assertEqual(engine.engine_core.abort_calls, [])
         self.assertEqual(engine.engine_core.add_calls, [])
-        self.assertEqual(len(engine.collective_calls), 1)
         self.assertEqual(
-            engine.collective_calls[0]["kwargs"],
+            [call["method"] for call in engine.collective_calls],
+            [
+                "invalidate_live_reload_state",
+                "reload_model_weights",
+                "invalidate_live_reload_state",
+            ],
+        )
+        self.assertEqual(
+            engine.collective_calls[1]["kwargs"],
             {"release_kv_cache": True},
         )
-        self.assertEqual(engine.collective_calls[0]["args"], ("new-ckpt",))
+        self.assertEqual(engine.collective_calls[1]["args"], ("new-ckpt",))
         self.assertTrue(app_state.first_weights_loaded.is_set())
         self.assertEqual(app_state.current_checkpoint_path, "new-ckpt")
 
@@ -245,9 +259,9 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(body["checkpoint_path"], "old-ckpt")
-        self.assertEqual(engine.collective_calls[0]["args"], ())
+        self.assertEqual(engine.collective_calls[1]["args"], ())
         self.assertEqual(
-            engine.collective_calls[0]["kwargs"],
+            engine.collective_calls[1]["kwargs"],
             {"release_kv_cache": False},
         )
         self.assertEqual(app_state.current_checkpoint_path, "old-ckpt")
@@ -294,7 +308,11 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.resume_calls, 0)
 
     async def test_preempt_mode_collective_failure_unpauses_and_errors(self):
-        engine = _FakeEngine(collective_exc=RuntimeError("rpc failed"))
+        engine = _FakeEngine(
+            collective_exc_by_method={
+                "reload_model_weights": RuntimeError("rpc failed"),
+            }
+        )
         app_state, raw_request = self._build_request(engine)
         payload = online_rl_server.ReloadWeightsRequest(
             checkpoint_path="new-ckpt",
@@ -310,6 +328,13 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 500)
         self.assertIn("rpc failed", cm.exception.detail)
         self.assertFalse(engine._paused)
+        self.assertEqual(
+            [call["method"] for call in engine.collective_calls],
+            [
+                "invalidate_live_reload_state",
+                "reload_model_weights",
+            ],
+        )
         self.assertEqual(app_state.current_checkpoint_path, "old-ckpt")
         self.assertFalse(app_state.first_weights_loaded.is_set())
 
@@ -330,7 +355,10 @@ class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 500)
         self.assertIn("reset_prefix_cache returned failure", cm.exception.detail)
         self.assertFalse(engine._paused)
-        self.assertEqual(engine.collective_calls, [])
+        self.assertEqual(
+            [call["method"] for call in engine.collective_calls],
+            ["invalidate_live_reload_state"],
+        )
         self.assertEqual(engine.reset_mm_cache_calls, 0)
         self.assertEqual(app_state.current_checkpoint_path, "old-ckpt")
         self.assertFalse(app_state.first_weights_loaded.is_set())
@@ -418,9 +446,94 @@ class TestPauseHelpers(unittest.IsolatedAsyncioTestCase):
             online_rl_server._ensure_pause_controls_supported(
                 _EngineMissingPauseInternals())
 
+    async def test_invalidate_live_reload_worker_state_uses_collective_rpc(self):
+        engine = _FakeEngine()
+        await online_rl_server._invalidate_live_reload_worker_state(engine)
+        self.assertEqual(
+            engine.collective_calls,
+            [
+                {
+                    "method": "invalidate_live_reload_state",
+                    "args": (),
+                    "kwargs": {},
+                }
+            ],
+        )
+
+    async def test_reload_waits_for_request_admission_gate(self):
+        engine = _FakeEngine()
+        app_state, raw_request = TestReloadWeightsEndpoint._build_request(engine)
+        gate = online_rl_server._get_request_admission_lock(app_state)
+        payload = online_rl_server.ReloadWeightsRequest(
+            checkpoint_path="new-ckpt",
+            wait_for_inflight_requests=False,
+            clear_cache=True,
+            release_kv_cache=True,
+            timeout_seconds=30.0,
+        )
+
+        async with gate:
+            reload_task = asyncio.create_task(
+                online_rl_server.reload_weights(payload, raw_request))
+            await asyncio.sleep(0)
+            self.assertEqual(engine.collective_calls, [])
+
+        response = await reload_task
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [call["method"] for call in engine.collective_calls],
+            [
+                "invalidate_live_reload_state",
+                "reload_model_weights",
+                "invalidate_live_reload_state",
+            ],
+        )
+
+    def test_scheduler_reload_generation_helpers(self):
+        scheduler = SimpleNamespace()
+        scheduler_output = SimpleNamespace()
+
+        online_rl_server._mark_scheduler_output_reload_generation(
+            scheduler,
+            scheduler_output,
+        )
+        self.assertFalse(
+            online_rl_server._is_stale_scheduler_output(scheduler, scheduler_output)
+        )
+
+        scheduler._tpu_reload_generation = 1
+        self.assertTrue(
+            online_rl_server._is_stale_scheduler_output(scheduler, scheduler_output)
+        )
+
+    def test_filter_scheduler_output_missing_req_indices(self):
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"req-1": 4, "req-2": 2},
+            scheduled_spec_decode_tokens={"req-1": [11], "req-2": [22]},
+        )
+        model_runner_output = SimpleNamespace(req_id_to_index={"req-1": 0})
+
+        filtered_output, missing_req_ids = (
+            online_rl_server._filter_scheduler_output_missing_req_indices(
+                scheduler_output,
+                model_runner_output,
+            )
+        )
+
+        self.assertEqual(missing_req_ids, ("req-2",))
+        self.assertEqual(filtered_output.num_scheduled_tokens, {"req-1": 4})
+        self.assertEqual(
+            filtered_output.scheduled_spec_decode_tokens,
+            {"req-1": [11]},
+        )
+
     def test_patch_async_scheduler_preempt_discard_idempotent(self):
         online_rl_server._patch_async_scheduler_preempt_discard()
         online_rl_server._patch_async_scheduler_preempt_discard()
+
+    def test_patch_scheduler_reload_stale_output_idempotent(self):
+        online_rl_server._patch_scheduler_reload_stale_output()
+        online_rl_server._patch_scheduler_reload_stale_output()
 
 
 class TestReloadWeightsStress(unittest.IsolatedAsyncioTestCase):
@@ -491,6 +604,14 @@ class TestReloadWeightsStress(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(req.regex_tracker.regex, regex)
         self.assertEqual(len(req.regex_tracker.accepted_token_ids), 128 + 8 * 256)
         self.assertEqual(len(engine.reset_prefix_cache_calls), 16)
+        self.assertEqual(len(engine.collective_calls), 24)
+        self.assertTrue(
+            all(
+                call["method"] == "invalidate_live_reload_state"
+                for idx, call in enumerate(engine.collective_calls)
+                if idx % 3 != 1
+            )
+        )
         self.assertFalse(engine._paused)
         self.assertEqual(app_state.current_checkpoint_path, "ckpt-7")
         self.assertTrue(app_state.first_weights_loaded.is_set())
@@ -537,7 +658,7 @@ class TestReloadWeightsStress(unittest.IsolatedAsyncioTestCase):
             await generation_task
 
         self.assertEqual(len(engine.reset_prefix_cache_calls), 24)
-        self.assertEqual(len(engine.collective_calls), 12)
+        self.assertEqual(len(engine.collective_calls), 36)
         self.assertEqual(engine.max_rpc_inflight, 1)
         self.assertEqual(id(req.regex_tracker), tracker_obj_id)
         self.assertGreater(len(req.regex_tracker.accepted_token_ids), 0)

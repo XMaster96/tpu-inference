@@ -10,9 +10,12 @@ from vllm import LLM, EngineArgs, SamplingParams
 
 @pytest.fixture
 def model_name():
-    """Choose gemma-27b as the test model as it has both full attention and 
-    sliding window attention."""
-    return "google/gemma-3-27b-it"
+    """Use a locally cached open model with sliding-window metadata."""
+    return (
+        "/home/jan/.cache/huggingface/hub/"
+        "models--Qwen--Qwen2.5-1.5B-Instruct/"
+        "snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+    )
 
 
 @pytest.fixture
@@ -84,7 +87,7 @@ def test_hybrid_kv_cache(
     sampling_params: SamplingParams,
 ):
     """
-    Test hybrid kv cache works on gemma vLLM models.
+    Test hybrid kv cache works on a vLLM model with sliding-window metadata.
     """
 
     os.environ['MODEL_IMPL_TYPE'] = 'vllm'

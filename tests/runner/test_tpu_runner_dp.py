@@ -13,12 +13,13 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
-from tpu_inference.runner.tpu_runner import TPUModelRunner
+from tpu_inference.runner.tpu_runner import AsyncPreResults, TPUModelRunner
 
 
 class TestTPUJaxRunnerDPInputsLightweight:
@@ -486,10 +487,10 @@ class TestTPUJaxRunnerDPInputsLightweight:
         max_num_reqs_per_dp = self.runner.max_num_reqs // 2
         expected_query_start = np.zeros(self.runner.max_num_reqs + 2,
                                         dtype=np.int32)
-        # DP rank 0: cumsum([2]) = [2] at positions [1:2] → [0, 2, 1, 1, 1]
+        # DP rank 0: cumsum([2]) = [2] at positions [1:2] -> [0, 2, 1, 1, 1]
         expected_query_start[1] = 2  # req1 has 2 tokens
         expected_query_start[2:max_num_reqs_per_dp + 1] = 1
-        # DP rank 1: cumsum([3]) = [3] at positions [6:7] → [0, 3, 1, 1, 1]
+        # DP rank 1: cumsum([3]) = [3] at positions [6:7] -> [0, 3, 1, 1, 1]
         expected_query_start[max_num_reqs_per_dp + 2] = 3  # req2 has 3 tokens
         expected_query_start[max_num_reqs_per_dp + 3:] = 1
         assert np.array_equal(query_start_loc, expected_query_start)
@@ -608,8 +609,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
         expected_query_start[2] = 5  # cumulative: 3 + 2 = 5
         expected_query_start[3:max_num_reqs_per_dp + 1] = 1  # padding
         # Rank 1: empty (all zeros)
-        expected_query_start[max_num_reqs_per_dp +
-                             1:] = 0  # Empty rank sets to 0
+        expected_query_start[max_num_reqs_per_dp + 1:] = 0  # Empty rank sets to 0
         assert np.array_equal(query_start_loc, expected_query_start)
 
         # 4. Verify seq_lens
@@ -1093,6 +1093,50 @@ class TestTPUJaxRunnerDPInputsLightweight:
         # Should have indices from both ranks
         assert len(token_in_tpu_cur_input_indices) == 2
         assert len(token_in_tpu_pre_next_tokens_indices) == 2
+
+    def test_modify_prev_results_skips_stale_request_without_placeholder(self):
+        self.runner._modify_prev_results = TPUModelRunner._modify_prev_results.__get__(
+            self.runner)
+        self.runner.max_model_len = 64
+        self.runner.input_batch.req_id_to_index = {"req1": 0}
+        self.runner.input_batch.num_tokens_no_spec = np.array([1], dtype=np.int32)
+        self.runner.input_batch.token_ids_cpu = np.zeros((1, 64), dtype=np.int32)
+
+        req_state = SimpleNamespace(
+            req_id="req1",
+            output_token_ids=[],
+        )
+        self.runner.requests = {"req1": req_state}
+        self.runner._pre_async_results = AsyncPreResults(
+            req_ids=["req1"],
+            next_tokens=np.array([123], dtype=np.int32),
+            request_seq_lens=[(0, req_state, 1)],
+            discard_sampled_tokens_req_indices=[],
+            placeholder_req_id_to_index={"req1": 0},
+            logits_indices_selector=None,
+        )
+
+        with patch(
+                "tpu_inference.runner.tpu_runner.jax.device_get",
+                side_effect=lambda value: value):
+            self.runner._modify_prev_results()
+
+        assert req_state.output_token_ids == []
+        np.testing.assert_array_equal(
+            self.runner.input_batch.token_ids_cpu,
+            np.zeros((1, 64), dtype=np.int32),
+        )
+
+    def test_invalidate_live_reload_state_clears_async_runner_state(self):
+        self.runner.invalidate_live_reload_state = (
+            TPUModelRunner.invalidate_live_reload_state.__get__(self.runner))
+        self.runner.execute_model_state = object()
+        self.runner._pre_async_results = object()
+
+        self.runner.invalidate_live_reload_state()
+
+        assert self.runner.execute_model_state is None
+        assert self.runner._pre_async_results is None
 
 
 if __name__ == "__main__":

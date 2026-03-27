@@ -7,6 +7,11 @@ import time
 import pytest
 from vllm import LLM, SamplingParams
 
+MODEL_NAME = (
+    "/home/jan/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/"
+    "snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
+)
+
 
 @pytest.fixture(autouse=True)
 def setup_new_model_design():
@@ -71,13 +76,14 @@ def _run_inference_with_config(model_name: str,
         async_scheduling=async_scheduling,
     )
 
-    start_time = time.time()
-    outputs = llm.generate(test_prompts, sampling_params)
-    elapsed_time = time.time() - start_time
-
-    del llm
-    time.sleep(10)
-    return outputs, elapsed_time
+    try:
+        start_time = time.time()
+        outputs = llm.generate(test_prompts, sampling_params)
+        elapsed_time = time.time() - start_time
+        return outputs, elapsed_time
+    finally:
+        del llm
+        time.sleep(10)
 
 
 def _check_performance(test_name: str, baseline_time: float, dp_time: float,
@@ -93,7 +99,9 @@ def _check_performance(test_name: str, baseline_time: float, dp_time: float,
     print(f"  Baseline throughput: {num_prompts/baseline_time:.2f} prompts/s")
     print(f"  Data parallel throughput: {num_prompts/dp_time:.2f} prompts/s")
 
-    assert speedup >= tol, f"Data parallelism did not provide expected speedup ({tol:.2f}x): {speedup:.2f}x"
+    assert speedup >= tol, (
+        f"Data parallelism did not provide expected speedup ({tol:.2f}x): "
+        f"{speedup:.2f}x")
 
 
 def _check_correctness(test_name, baseline_outputs, dp_outputs):
@@ -117,41 +125,34 @@ def _check_correctness(test_name, baseline_outputs, dp_outputs):
         if match_percent >= 0.7:
             text_matches += 1
 
-        # Check text output
         if baseline_text != dp_text:
             print(f"Text mismatch found in prompt {i}:")
             print(f"  Baseline: {baseline_text}")
             print(f"  Data Parallel: {dp_text}")
             print(f"  Match percent: {match_percent:.2%}")
 
-        # Check log probabilities
         baseline_logprobs = baseline.outputs[0].logprobs
         dp_logprobs = dp_result.outputs[0].logprobs
 
         if baseline_logprobs is not None and dp_logprobs is not None:
-            # Compare log probabilities for each token
-            assert len(baseline_logprobs) == len(dp_logprobs), \
-                f"Logprobs length mismatch: {len(baseline_logprobs)} vs {len(dp_logprobs)}"
+            assert len(baseline_logprobs) == len(dp_logprobs), (
+                f"Logprobs length mismatch: {len(baseline_logprobs)} vs "
+                f"{len(dp_logprobs)}")
 
             for token_idx, (base_lp, dp_lp) in enumerate(
                     zip(baseline_logprobs, dp_logprobs)):
-                # Get the top logprob value for the selected token
                 if base_lp and dp_lp:
-                    # Get the top token's logprob from each
                     base_top_token = list(base_lp.keys())[0]
                     dp_top_token = list(dp_lp.keys())[0]
 
-                    # Only compare logprobs if tokens match
                     if base_top_token == dp_top_token:
                         base_logprob_val = base_lp[base_top_token].logprob
                         dp_logprob_val = dp_lp[dp_top_token].logprob
 
-                        # Calculate absolute difference
                         diff = abs(base_logprob_val - dp_logprob_val)
                         max_logprob_diff = max(max_logprob_diff, diff)
 
                         total_compared_logprobs += 1
-                        # Count as match if difference is small
                         if diff < 0.1:
                             logprob_matches += 1
                         else:
@@ -163,20 +164,21 @@ def _check_correctness(test_name, baseline_outputs, dp_outputs):
 
     print(f"✓ {test_name} correctness test results:")
     print(f"  Text: {text_matches} matches (match percent >= 70%)")
-    print(
-        f"  Logprobs: {logprob_matches}/{total_compared_logprobs} ({logprob_matches / total_compared_logprobs:.2%}) matches (diff < 0.1)"
-    )
+    if total_compared_logprobs > 0:
+        print(
+            f"  Logprobs: {logprob_matches}/{total_compared_logprobs} "
+            f"({logprob_matches / total_compared_logprobs:.2%}) matches "
+            f"(diff < 0.1)")
     print(f"  Max logprob difference: {max_logprob_diff:.6e}")
 
-    # Allow for some variance due to potential numerical differences
-    # but most outputs should match with greedy sampling
     text_match_rate = text_matches / len(baseline_outputs)
-    assert text_match_rate >= 0.9, f"Text match rate {text_match_rate:.2%} is too low"
+    assert text_match_rate >= 0.9, (
+        f"Text match rate {text_match_rate:.2%} is too low")
 
-    # Log probabilities should match for most matching tokens
     if total_compared_logprobs > 0:
         logprob_match_rate = logprob_matches / total_compared_logprobs
-        assert logprob_match_rate >= 0.9, f"Logprob match rate {logprob_match_rate:.2%} is too low"
+        assert logprob_match_rate >= 0.9, (
+            f"Logprob match rate {logprob_match_rate:.2%} is too low")
 
 
 def test_attention_data_parallelism(
@@ -184,20 +186,18 @@ def test_attention_data_parallelism(
     sampling_params: SamplingParams,
 ):
     """
-    Correctness and performance test for attention DP     
+    Correctness and performance test for attention DP.
     """
 
     os.environ['MODEL_IMPL_TYPE'] = "vllm"
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
 
-    # Configuration for long sequences
     max_model_len = 2048
     max_num_batched_tokens = 4096
     max_num_seqs = 128
+    gpu_memory_utilization = 0.8
 
-    # Run with attn_dp=2 tp=2
     dp_outputs, dp_time = _run_inference_with_config(
-        model_name=model_name,
+        model_name=MODEL_NAME,
         test_prompts=test_prompts,
         sampling_params=sampling_params,
         tensor_parallel_size=4,
@@ -205,6 +205,7 @@ def test_attention_data_parallelism(
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=gpu_memory_utilization,
         additional_config={
             "sharding": {
                 "sharding_strategy": {
@@ -213,9 +214,8 @@ def test_attention_data_parallelism(
             }
         })
 
-    # Run baseline (tp=2)
     baseline_outputs, baseline_time = _run_inference_with_config(
-        model_name=model_name,
+        model_name=MODEL_NAME,
         test_prompts=test_prompts,
         sampling_params=sampling_params,
         tensor_parallel_size=2,
@@ -224,12 +224,11 @@ def test_attention_data_parallelism(
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=max_num_seqs,
+        gpu_memory_utilization=gpu_memory_utilization,
     )
 
     _check_correctness("Attention data parallelism", baseline_outputs,
                        dp_outputs)
-
-    # Different hardware gives different performance. This test runs on v6e_8
     _check_performance("Attention data parallelism",
                        baseline_time,
                        dp_time,
@@ -242,20 +241,16 @@ def test_data_parallelism(
     test_prompts: list,
 ):
     """
-    Correctness and performance test for model DP 
+    Correctness and performance test for model DP.
     """
     os.environ['MODEL_IMPL_TYPE'] = "flax_nnx"
 
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-
-    # Configuration for long sequences
     max_model_len = 2048
     max_num_batched_tokens = 4096
     max_num_seqs = 128
 
-    # Run with data parallelism (dp=2, tp=1)
     dp_outputs, dp_time = _run_inference_with_config(
-        model_name=model_name,
+        model_name=MODEL_NAME,
         test_prompts=test_prompts,
         sampling_params=sampling_params,
         tensor_parallel_size=1,
@@ -266,9 +261,8 @@ def test_data_parallelism(
         max_num_seqs=max_num_seqs,
     )
 
-    # Run baseline (tp=1)
     baseline_outputs, baseline_time = _run_inference_with_config(
-        model_name=model_name,
+        model_name=MODEL_NAME,
         test_prompts=test_prompts,
         sampling_params=sampling_params,
         tensor_parallel_size=1,
@@ -280,8 +274,6 @@ def test_data_parallelism(
     )
 
     _check_correctness("Data parallelism", baseline_outputs, dp_outputs)
-
-    # Test is too small to see significant speedup, mainly for testing regression
     _check_performance("Data parallelism",
                        baseline_time,
                        dp_time,
