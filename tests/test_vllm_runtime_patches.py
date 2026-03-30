@@ -6,13 +6,16 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.request import RequestStatus
 
+from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from tpu_inference.vllm_runtime_patches import (
     apply_vllm_runtime_patches,
+    filter_scheduler_output_missing_req_indices,
     patch_async_scheduler_preempt_discard,
     patch_async_llm_request_admission_gate,
+    requeue_missing_live_reload_requests,
     run_with_request_admission_gate,
 )
 
@@ -60,6 +63,125 @@ def test_scheduler_patch_drops_reload_stale_req_ids_without_keyerror():
         model_runner_output,
     )
     assert outputs == {}
+
+
+def test_filter_scheduler_output_missing_req_indices_filters_cached_state():
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {
+        "req-0": 1,
+        "req-1": 2,
+    }
+    scheduler_output.total_num_scheduled_tokens = 3
+    scheduler_output.scheduled_new_reqs = [
+        SimpleNamespace(req_id="req-0"),
+        SimpleNamespace(req_id="req-1"),
+    ]
+    scheduler_output.scheduled_cached_reqs = CachedRequestData(
+        req_ids=["req-0", "req-1"],
+        resumed_req_ids={"req-1"},
+        new_token_ids=[[11], [22]],
+        all_token_ids={"req-0": [1, 2], "req-1": [3, 4]},
+        new_block_ids=[None, ([7],)],
+        num_computed_tokens=[2, 4],
+        num_output_tokens=[0, 1],
+    )
+    scheduler_output.scheduled_spec_decode_tokens = {
+        "req-1": [99],
+    }
+    scheduler_output.scheduled_encoder_inputs = {
+        "req-0": [0],
+        "req-1": [1],
+    }
+    scheduler_output.assigned_dp_rank = {
+        "req-0": 0,
+        "req-1": 1,
+    }
+    scheduler_output.num_invalid_spec_tokens = {
+        "req-0": 0,
+        "req-1": 1,
+    }
+
+    filtered_output, missing_req_ids = filter_scheduler_output_missing_req_indices(
+        scheduler_output,
+        SimpleNamespace(req_id_to_index={"req-0": 0}),
+    )
+
+    assert missing_req_ids == ("req-1",)
+    assert filtered_output.total_num_scheduled_tokens == 1
+    assert filtered_output.num_scheduled_tokens == {"req-0": 1}
+    assert [req.req_id for req in filtered_output.scheduled_new_reqs] == ["req-0"]
+    assert filtered_output.scheduled_cached_reqs.req_ids == ["req-0"]
+    assert filtered_output.scheduled_cached_reqs.resumed_req_ids == set()
+    assert filtered_output.scheduled_cached_reqs.new_token_ids == [[11]]
+    assert filtered_output.scheduled_cached_reqs.all_token_ids == {
+        "req-0": [1, 2],
+    }
+    assert filtered_output.scheduled_cached_reqs.num_output_tokens == [0]
+    assert filtered_output.scheduled_spec_decode_tokens == {}
+    assert filtered_output.scheduled_encoder_inputs == {"req-0": [0]}
+    assert filtered_output.assigned_dp_rank == {"req-0": 0}
+    assert filtered_output.num_invalid_spec_tokens == {"req-0": 0}
+
+
+def test_requeue_missing_live_reload_requests_preempts_running_request():
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[object] = []
+
+        def prepend_request(self, request):
+            self.prepended.append(request)
+
+    waiting = _WaitingQueue()
+    request0 = SimpleNamespace(
+        request_id="req-0",
+        status=RequestStatus.RUNNING,
+        num_computed_tokens=4,
+        num_output_placeholders=1,
+        spec_token_ids=[1],
+        num_preemptions=0,
+        discard_latest_async_tokens=True,
+    )
+    request1 = SimpleNamespace(
+        request_id="req-1",
+        status=RequestStatus.RUNNING,
+        num_computed_tokens=7,
+        num_output_placeholders=3,
+        spec_token_ids=[2, 3],
+        num_preemptions=0,
+        discard_latest_async_tokens=True,
+    )
+
+    def _preempt_request(request, _timestamp):
+        assert request.status == RequestStatus.RUNNING
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.spec_token_ids.clear()
+        request.num_preemptions += 1
+        waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={
+            "req-0": request0,
+            "req-1": request1,
+        },
+        running=[request0, request1],
+        waiting=waiting,
+        prev_step_scheduled_req_ids={"req-0", "req-1"},
+        _preempt_request=_preempt_request,
+    )
+
+    requeue_missing_live_reload_requests(scheduler, ("req-1",))
+
+    assert scheduler.running == [request0]
+    assert waiting.prepended == [request1]
+    assert scheduler.prev_step_scheduled_req_ids == {"req-0"}
+    assert request1.status == RequestStatus.PREEMPTED
+    assert request1.num_computed_tokens == 0
+    assert request1.num_output_placeholders == 0
+    assert request1.spec_token_ids == []
+    assert request1.num_preemptions == 1
+    assert request1.discard_latest_async_tokens is False
 
 
 def test_async_scheduler_patch_clears_preempt_discard_for_waiting_requests(

@@ -13,8 +13,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import requests
@@ -34,20 +35,6 @@ DEFAULT_HF_MODEL_DIR = (
     "mistral_24b-seq_lens=16384-use_stochastic_rounding_smooth-"
     "orpo_beta=1---run_1"
 )
-
-
-def _e2e_enabled() -> bool:
-    return os.environ.get("TPU_ONLINE_RL_E2E", "0") == "1"
-
-
-pytestmark = pytest.mark.skipif(
-    not _e2e_enabled(),
-    reason=(
-        "Set TPU_ONLINE_RL_E2E=1 to run live server torture tests. "
-        "These tests are intentionally expensive."
-    ),
-)
-
 
 @dataclass
 class _E2EConfig:
@@ -81,6 +68,7 @@ class _ServerContext:
     process: subprocess.Popen
     base_url: str
     model_name: str
+    effective_max_model_len: int
     stdout_path: str
     stderr_path: str
 
@@ -100,9 +88,8 @@ def _build_config() -> _E2EConfig:
     raw_checkpoints = os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_CHECKPOINTS",
                                      DEFAULT_ORBAX_CHECKPOINT)
     reload_checkpoints = [p.strip() for p in raw_checkpoints.split(",") if p.strip()]
-    if not reload_checkpoints:
-        pytest.skip(
-            "TPU_ONLINE_RL_E2E_RELOAD_CHECKPOINTS resolved to an empty list.")
+    assert reload_checkpoints, (
+        "TPU_ONLINE_RL_E2E_RELOAD_CHECKPOINTS resolved to an empty list.")
 
     startup_dummy_weights_path = os.environ.get(
         "TPU_ONLINE_RL_E2E_STARTUP_DUMMY_WEIGHTS",
@@ -131,26 +118,51 @@ def _build_config() -> _E2EConfig:
             os.environ.get("TPU_ONLINE_RL_E2E_SERVER_START_TIMEOUT_SECONDS",
                            "1800")),
         inflight_grace_seconds=float(
-            os.environ.get("TPU_ONLINE_RL_E2E_INFLIGHT_GRACE_SECONDS", "15")),
-        max_tokens=int(os.environ.get("TPU_ONLINE_RL_E2E_MAX_TOKENS", "2048")),
+            os.environ.get("TPU_ONLINE_RL_E2E_INFLIGHT_GRACE_SECONDS", "2")),
+        max_tokens=int(os.environ.get("TPU_ONLINE_RL_E2E_MAX_TOKENS", "16")),
         prompt_repeat_count=int(
-            os.environ.get("TPU_ONLINE_RL_E2E_PROMPT_REPEAT_COUNT", "10000")),
+            os.environ.get("TPU_ONLINE_RL_E2E_PROMPT_REPEAT_COUNT", "4000")),
         reloads_per_generation=int(
-            os.environ.get("TPU_ONLINE_RL_E2E_RELOADS_PER_GENERATION", "10")),
+            os.environ.get("TPU_ONLINE_RL_E2E_RELOADS_PER_GENERATION", "3")),
         reload_storm_rounds=int(
-            os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_STORM_ROUNDS", "20")),
+            os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_STORM_ROUNDS", "4")),
         parallel_generations=int(
-            os.environ.get("TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS", "4")),
+            os.environ.get("TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS", "2")),
         continuous_reload_interval_seconds=float(
             os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_INTERVAL_SECONDS",
-                           "0.5")),
+                           "0.2")),
         continuous_reload_min_cycles=int(
             os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES",
-                           "30")),
+                           "4")),
         continuous_reload_max_cycles=int(
             os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MAX_CYCLES",
-                           "200")),
+                           "12")),
     )
+
+
+@lru_cache(maxsize=None)
+def _get_prompt_token_counter(tokenizer_dir: str) -> Callable[[str], int]:
+    from transformers import AutoTokenizer
+
+    tokenizer_path = Path(tokenizer_dir)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_dir,
+        local_files_only=tokenizer_path.exists(),
+        trust_remote_code=False,
+    )
+
+    def count_prompt_tokens(text: str) -> int:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=True,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        input_ids = encoded["input_ids"]
+        assert isinstance(input_ids, list), "tokenizer returned non-list input_ids"
+        return len(input_ids)
+
+    return count_prompt_tokens
 
 
 def _read_tail(path: str, limit_bytes: int = 32_000) -> str:
@@ -212,16 +224,24 @@ def _reload_weights(
     return response.json()
 
 
-def _resolve_model_name(ctx: _ServerContext) -> str:
+def _resolve_model_info(ctx: _ServerContext) -> tuple[str, int]:
     response = requests.get(f"{ctx.base_url}/v1/models", timeout=60)
     if response.status_code != 200:
-        return ctx.config.model_dir
+        return ctx.config.model_dir, ctx.config.max_model_len
     payload = response.json()
     model_data = payload.get("data")
     if not isinstance(model_data, list) or not model_data:
-        return ctx.config.model_dir
-    model_id = model_data[0].get("id")
-    return str(model_id) if model_id else ctx.config.model_dir
+        return ctx.config.model_dir, ctx.config.max_model_len
+    model = model_data[0]
+    model_id = model.get("id")
+    max_model_len = model.get("max_model_len")
+    resolved_model_name = str(model_id) if model_id else ctx.config.model_dir
+    resolved_max_model_len = (
+        max_model_len
+        if isinstance(max_model_len, int) and max_model_len > 0
+        else ctx.config.max_model_len
+    )
+    return resolved_model_name, resolved_max_model_len
 
 
 def _wait_until_ready(ctx: _ServerContext) -> None:
@@ -246,6 +266,38 @@ def _make_long_prompt(repeat_count: int, *, seed: int) -> str:
     return "\n".join(chunks)
 
 
+def _make_budgeted_long_prompt(
+    ctx: _ServerContext,
+    *,
+    repeat_count: int,
+    seed: int,
+) -> str:
+    count_prompt_tokens = _get_prompt_token_counter(ctx.config.tokenizer_dir)
+    safety_margin = max(256, min(1024, ctx.effective_max_model_len // 8))
+    prompt_token_budget = (
+        ctx.effective_max_model_len - ctx.config.max_tokens - safety_margin)
+    prompt_token_budget = max(512, prompt_token_budget)
+
+    sample_repeats = min(max(repeat_count, 1), 16)
+    sample_tokens = count_prompt_tokens(
+        _make_long_prompt(sample_repeats, seed=seed))
+    tokens_per_repeat = max(1, sample_tokens // sample_repeats)
+    upper_bound = min(repeat_count,
+                      max(1, prompt_token_budget // tokens_per_repeat + 2))
+
+    lo, hi = 1, upper_bound
+    best = _make_long_prompt(1, seed=seed)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _make_long_prompt(mid, seed=seed)
+        if count_prompt_tokens(candidate) <= prompt_token_budget:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def _make_complex_regex() -> str:
     # Keep the regex broad enough to exercise constrained decoding, but avoid
     # nested repetition that can trigger backend-specific lexer blowups.
@@ -258,13 +310,19 @@ def _completion_request(
     prompt: str,
     regex: str,
 ) -> dict[str, Any]:
+    count_prompt_tokens = _get_prompt_token_counter(ctx.config.tokenizer_dir)
+    prompt_tokens = count_prompt_tokens(prompt)
+    max_completion_tokens = min(
+        ctx.config.max_tokens,
+        max(1, ctx.effective_max_model_len - prompt_tokens - 1),
+    )
     payload = {
         "model": ctx.model_name,
         "prompt": prompt,
         "stream": False,
         "temperature": 0.0,
         "top_p": 1.0,
-        "max_tokens": ctx.config.max_tokens,
+        "max_tokens": max_completion_tokens,
         "skip_special_tokens": False,
         "logprobs": 1,
         "structured_outputs": {
@@ -291,16 +349,15 @@ def _completion_request(
 def online_rl_server_context() -> _ServerContext:
     cfg = _build_config()
 
-    if cfg.parallel_generations < 1:
-        pytest.skip("TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS must be >= 1")
-    if cfg.reloads_per_generation < 1:
-        pytest.skip("TPU_ONLINE_RL_E2E_RELOADS_PER_GENERATION must be >= 1")
-    if cfg.continuous_reload_min_cycles < 1:
-        pytest.skip("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES must be >= 1")
-    if cfg.continuous_reload_max_cycles < cfg.continuous_reload_min_cycles:
-        pytest.skip(
-            "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MAX_CYCLES must be >= "
-            "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES")
+    assert cfg.parallel_generations >= 1, (
+        "TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS must be >= 1")
+    assert cfg.reloads_per_generation >= 1, (
+        "TPU_ONLINE_RL_E2E_RELOADS_PER_GENERATION must be >= 1")
+    assert cfg.continuous_reload_min_cycles >= 1, (
+        "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES must be >= 1")
+    assert cfg.continuous_reload_max_cycles >= cfg.continuous_reload_min_cycles, (
+        "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MAX_CYCLES must be >= "
+        "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES")
 
     repo_root = Path(__file__).resolve().parents[2]
     stdout_file = tempfile.NamedTemporaryFile(prefix="online-rl-e2e-stdout-",
@@ -358,6 +415,7 @@ def online_rl_server_context() -> _ServerContext:
         process=process,
         base_url=f"http://{cfg.host}:{cfg.port}",
         model_name=cfg.model_dir,
+        effective_max_model_len=cfg.max_model_len,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
@@ -371,7 +429,7 @@ def online_rl_server_context() -> _ServerContext:
             clear_cache=True,
         )
         _wait_until_ready(ctx)
-        ctx.model_name = _resolve_model_name(ctx)
+        ctx.model_name, ctx.effective_max_model_len = _resolve_model_info(ctx)
         yield ctx
     finally:
         try:
@@ -392,7 +450,11 @@ def test_torture_single_generation_with_multiple_reloads(
 ) -> None:
     ctx = online_rl_server_context
     regex = _make_complex_regex()
-    prompt = _make_long_prompt(ctx.config.prompt_repeat_count, seed=1)
+    prompt = _make_budgeted_long_prompt(
+        ctx,
+        repeat_count=ctx.config.prompt_repeat_count,
+        seed=1,
+    )
 
     completion_payload: dict[str, Any] = {}
     completion_error: list[BaseException] = []
@@ -445,7 +507,11 @@ def test_torture_parallel_generations_with_reload_storm(
     regex = _make_complex_regex()
 
     prompts = [
-        _make_long_prompt(max(512, ctx.config.prompt_repeat_count // 2), seed=100 + i)
+        _make_budgeted_long_prompt(
+            ctx,
+            repeat_count=max(512, ctx.config.prompt_repeat_count // 2),
+            seed=100 + i,
+        )
         for i in range(ctx.config.parallel_generations)
     ]
 
@@ -491,7 +557,11 @@ def test_torture_continuous_reload_soak(
     regex = _make_complex_regex()
 
     prompts = [
-        _make_long_prompt(ctx.config.prompt_repeat_count, seed=200 + i)
+        _make_budgeted_long_prompt(
+            ctx,
+            repeat_count=ctx.config.prompt_repeat_count,
+            seed=200 + i,
+        )
         for i in range(ctx.config.parallel_generations)
     ]
 

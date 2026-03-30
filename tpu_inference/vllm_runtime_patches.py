@@ -46,20 +46,145 @@ def filter_scheduler_output_missing_req_indices(
     if not missing_req_ids:
         return scheduler_output, ()
 
+    kept_req_ids = set(num_scheduled_tokens) - set(missing_req_ids)
     filtered_output = copy.copy(scheduler_output)
     filtered_output.num_scheduled_tokens = {
         req_id: num_tokens
         for req_id, num_tokens in num_scheduled_tokens.items()
-        if req_id in req_id_to_index
+        if req_id in kept_req_ids
     }
+    filtered_output.total_num_scheduled_tokens = sum(
+        filtered_output.num_scheduled_tokens.values()
+    )
     filtered_output.scheduled_spec_decode_tokens = {
         req_id: token_ids
         for req_id, token_ids in getattr(
             scheduler_output, "scheduled_spec_decode_tokens", {}
         ).items()
-        if req_id in req_id_to_index
+        if req_id in kept_req_ids
     }
+    filtered_output.scheduled_encoder_inputs = {
+        req_id: encoder_inputs
+        for req_id, encoder_inputs in getattr(
+            scheduler_output, "scheduled_encoder_inputs", {}
+        ).items()
+        if req_id in kept_req_ids
+    }
+    filtered_output.scheduled_new_reqs = [
+        req_data
+        for req_data in getattr(scheduler_output, "scheduled_new_reqs", ())
+        if getattr(req_data, "req_id", None) in kept_req_ids
+    ]
+
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    if cached_reqs is not None:
+        keep_indices = [
+            index
+            for index, req_id in enumerate(getattr(cached_reqs, "req_ids", ()))
+            if req_id in kept_req_ids
+        ]
+        filtered_cached_reqs = copy.copy(cached_reqs)
+        filtered_cached_reqs.req_ids = [
+            cached_reqs.req_ids[index] for index in keep_indices
+        ]
+        filtered_cached_reqs.resumed_req_ids = {
+            req_id
+            for req_id in getattr(cached_reqs, "resumed_req_ids", set())
+            if req_id in kept_req_ids
+        }
+        filtered_cached_reqs.new_token_ids = [
+            cached_reqs.new_token_ids[index] for index in keep_indices
+        ]
+        filtered_cached_reqs.all_token_ids = {
+            req_id: token_ids
+            for req_id, token_ids in getattr(cached_reqs, "all_token_ids", {}).items()
+            if req_id in kept_req_ids
+        }
+        filtered_cached_reqs.new_block_ids = [
+            cached_reqs.new_block_ids[index] for index in keep_indices
+        ]
+        filtered_cached_reqs.num_computed_tokens = [
+            cached_reqs.num_computed_tokens[index] for index in keep_indices
+        ]
+        filtered_cached_reqs.num_output_tokens = [
+            cached_reqs.num_output_tokens[index] for index in keep_indices
+        ]
+        filtered_cached_reqs.__dict__.pop("_req_id_to_num_output_tokens", None)
+        filtered_output.scheduled_cached_reqs = filtered_cached_reqs
+
+    assigned_dp_rank = getattr(scheduler_output, "assigned_dp_rank", None)
+    if assigned_dp_rank is not None:
+        filtered_output.assigned_dp_rank = {
+            req_id: dp_rank
+            for req_id, dp_rank in assigned_dp_rank.items()
+            if req_id in kept_req_ids
+        }
+
+    num_invalid_spec_tokens = getattr(
+        scheduler_output, "num_invalid_spec_tokens", None)
+    if num_invalid_spec_tokens is not None:
+        filtered_output.num_invalid_spec_tokens = {
+            req_id: count
+            for req_id, count in num_invalid_spec_tokens.items()
+            if req_id in kept_req_ids
+        }
+
     return filtered_output, missing_req_ids
+
+
+def requeue_missing_live_reload_requests(
+    scheduler,
+    missing_req_ids,
+) -> None:
+    if not missing_req_ids:
+        return
+
+    prev_step_scheduled_req_ids = getattr(
+        scheduler, "prev_step_scheduled_req_ids", None)
+    if prev_step_scheduled_req_ids is not None:
+        prev_step_scheduled_req_ids.difference_update(missing_req_ids)
+
+    running = getattr(scheduler, "running", None)
+    waiting = getattr(scheduler, "waiting", None)
+    preempt_request = getattr(scheduler, "_preempt_request", None)
+    timestamp = time.monotonic()
+
+    try:
+        from vllm.v1.request import RequestStatus
+    except Exception:
+        RequestStatus = None
+
+    for req_id in missing_req_ids:
+        request = getattr(scheduler, "requests", {}).get(req_id)
+        if request is None:
+            continue
+
+        removed_from_running = False
+        if isinstance(running, list):
+            try:
+                running.remove(request)
+                removed_from_running = True
+            except ValueError:
+                pass
+
+        if callable(preempt_request) and removed_from_running:
+            preempt_request(request, timestamp)
+        else:
+            if RequestStatus is not None:
+                request.status = RequestStatus.PREEMPTED
+            if hasattr(request, "num_computed_tokens"):
+                request.num_computed_tokens = 0
+            if hasattr(request, "spec_token_ids"):
+                request.spec_token_ids.clear()
+            if hasattr(request, "num_preemptions"):
+                request.num_preemptions += 1
+            if hasattr(waiting, "prepend_request"):
+                waiting.prepend_request(request)
+
+        if hasattr(request, "num_output_placeholders"):
+            request.num_output_placeholders = 0
+        if hasattr(request, "discard_latest_async_tokens"):
+            request.discard_latest_async_tokens = False
 
 
 def patch_async_scheduler_preempt_discard() -> None:
@@ -250,6 +375,7 @@ def patch_scheduler_reload_stale_output() -> None:
             )
         )
         if missing_req_ids:
+            requeue_missing_live_reload_requests(self, missing_req_ids)
             logger.warning(
                 "Dropping stale model output entries missing request indices "
                 "after live reload preemption for request ids: %s",
