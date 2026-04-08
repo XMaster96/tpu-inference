@@ -143,15 +143,21 @@ class InputBatch:
         req_index: Optional[int] = None,
     ) -> None:
         if req_index is None:
-            req_index = self.num_reqs
+            try:
+                req_index = self._req_ids.index(None)
+            except ValueError:
+                req_index = len(self._req_ids)
         assert req_index < self.max_num_reqs, f"{req_index} < {self.max_num_reqs} failed!"
 
         req_id = request.req_id
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
-            self.req_output_token_ids.append(request.output_token_ids)
         else:
             self._req_ids[req_index] = req_id
+
+        if req_index == len(self.req_output_token_ids):
+            self.req_output_token_ids.append(request.output_token_ids)
+        else:
             self.req_output_token_ids[req_index] = request.output_token_ids
 
         self.req_id_to_index[req_id] = req_index
@@ -237,12 +243,34 @@ class InputBatch:
             # No LoRA
             self.request_lora_mapping[req_index] = 0
 
+    def _resolve_req_index(self, req_id: str) -> Optional[int]:
+        req_index = self.req_id_to_index.get(req_id)
+        if (
+            req_index is not None
+            and req_index < len(self._req_ids)
+            and req_index < len(self.req_output_token_ids)
+            and self._req_ids[req_index] == req_id
+        ):
+            return req_index
+
+        for actual_index, current_req_id in enumerate(self._req_ids):
+            if (
+                current_req_id == req_id
+                and actual_index < len(self.req_output_token_ids)
+            ):
+                self.req_id_to_index[req_id] = actual_index
+                return actual_index
+
+        self.req_id_to_index.pop(req_id, None)
+        return None
+
     def remove_request(self, req_id: str) -> Optional[int]:
         """This method must always be followed by a call to condense()."""
 
-        req_index = self.req_id_to_index.pop(req_id, None)
+        req_index = self._resolve_req_index(req_id)
         if req_index is None:
             return None
+        self.req_id_to_index.pop(req_id, None)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
 

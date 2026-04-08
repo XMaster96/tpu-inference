@@ -141,6 +141,39 @@ def test_remove_request(input_batch: InputBatch):
     assert "req-1" not in input_batch.greedy_reqs
 
 
+def test_add_request_reuses_first_empty_slot(input_batch: InputBatch):
+    """New requests should fill gaps instead of overwriting live entries."""
+    req0 = create_dummy_request("req-0")
+    req1 = create_dummy_request("req-1")
+    req2 = create_dummy_request("req-2")
+    input_batch.add_request(req0)
+    input_batch.add_request(req1)
+
+    removed_index = input_batch.remove_request("req-0")
+    assert removed_index == 0
+
+    input_batch.add_request(req2)
+
+    assert input_batch._req_ids[0] == "req-2"
+    assert input_batch._req_ids[1] == "req-1"
+    assert input_batch.req_id_to_index["req-2"] == 0
+    assert input_batch.req_id_to_index["req-1"] == 1
+
+
+def test_remove_request_recovers_from_stale_out_of_range_mapping(
+    input_batch: InputBatch,
+):
+    req = create_dummy_request("req-1")
+    input_batch.add_request(req)
+    input_batch.req_id_to_index["req-1"] = 5
+
+    removed_index = input_batch.remove_request("req-1")
+
+    assert removed_index == 0
+    assert "req-1" not in input_batch.req_id_to_index
+    assert input_batch._req_ids[0] is None
+
+
 def test_condense(input_batch: InputBatch):
     """Tests condensing the batch after removing requests."""
     reqs = [create_dummy_request(f"req-{i}") for i in range(4)]

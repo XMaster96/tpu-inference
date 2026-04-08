@@ -55,6 +55,7 @@ from vllm.entrypoints.utils import (
     load_aware_call,
     with_cancellation,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.system_utils import decorate_logs
@@ -99,6 +100,26 @@ def models(request: Request) -> OpenAIServingModels:
 
 def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
+
+
+def _get_truncated_completion_request(
+    request: object,
+    handler: OpenAIServingCompletion,
+):
+    if not isinstance(request, TPUCompletionRequest):
+        return None
+    if request.truncate_prompt_tokens is not None:
+        return None
+
+    max_model_len = getattr(handler, "max_model_len", None)
+    if not isinstance(max_model_len, int) or max_model_len <= 0:
+        return None
+
+    max_input_tokens = max_model_len - (request.max_tokens or 0)
+    if max_input_tokens <= 0:
+        return None
+
+    return request.model_copy(update={"truncate_prompt_tokens": max_input_tokens})
 
 
 def _weights_ready(app_state) -> bool:
@@ -240,7 +261,20 @@ async def create_completion(request: TPUCompletionRequest, raw_request: Request)
             request,
             raw_request.app.state.args.structured_outputs_config.backend,
         )
-        output = await handler.create_completion(normalized_request, raw_request)
+        try:
+            output = await handler.create_completion(normalized_request, raw_request)
+        except VLLMValidationError as exc:
+            retry_request = None
+            if getattr(exc, "parameter", None) == "input_tokens":
+                retry_request = _get_truncated_completion_request(
+                    normalized_request,
+                    handler,
+                )
+
+            if retry_request is None:
+                raise
+
+            output = await handler.create_completion(retry_request, raw_request)
     except Exception as exc:
         error = handler.create_error_response(exc)
         return JSONResponse(content=error.model_dump(), status_code=error.error.code)
