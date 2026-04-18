@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 from vllm.sampling_params import SamplingParams
 
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
@@ -84,6 +85,7 @@ class TestPersistentBatchManager(unittest.TestCase):
         self.assertEqual(manager.input_batch.num_tokens[0], 3)
         self.assertEqual(manager.input_batch.num_tokens_no_spec[0], 3)
 
+    @pytest.mark.online_rl_server_related
     def test_update_states_recovers_from_stale_finished_request_index(self):
         req_id = "req-1"
         req_state = CachedRequestState(

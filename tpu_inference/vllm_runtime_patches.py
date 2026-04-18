@@ -184,7 +184,7 @@ def requeue_missing_live_reload_requests(
         if hasattr(request, "num_output_placeholders"):
             request.num_output_placeholders = 0
         if hasattr(request, "discard_latest_async_tokens"):
-            request.discard_latest_async_tokens = False
+            request.discard_latest_async_tokens = True
 
 
 def patch_async_scheduler_preempt_discard() -> None:
@@ -201,10 +201,18 @@ def patch_async_scheduler_preempt_discard() -> None:
 
     def _patched_update_request_with_output(self, request, new_token_ids):
         if getattr(request, "discard_latest_async_tokens", False):
-            # Live reload preemption already invalidates stale async outputs at
-            # the scheduler boundary. Clearing this flag unconditionally avoids
-            # discarding the first valid post-reload token for resumed requests
-            # that are still transitioning through WAITING/PREEMPTED states.
+            num_output_placeholders = int(
+                getattr(request, "num_output_placeholders", 0) or 0)
+            if num_output_placeholders < len(new_token_ids):
+                # Forced reload preemption resets placeholders to zero. If an
+                # async output arrives before the request has been rescheduled
+                # for at least this many fresh output tokens, it still belongs
+                # to the pre-reload execution and must be dropped.
+                request.discard_latest_async_tokens = False
+                return [], False
+
+            # The request has already been rescheduled for enough new output
+            # tokens, so this async result is from the post-reload execution.
             request.discard_latest_async_tokens = False
         return original_update_with_output(self, request, new_token_ids)
 

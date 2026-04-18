@@ -4,7 +4,9 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from vllm.sampling_params import SamplingParams
 from vllm.v1.request import RequestStatus
+from vllm.v1.request import Request
 
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -18,6 +20,8 @@ from tpu_inference.vllm_runtime_patches import (
     requeue_missing_live_reload_requests,
     run_with_request_admission_gate,
 )
+
+pytestmark = pytest.mark.online_rl_server_related
 
 
 def test_tpu_worker_import_installs_vllm_runtime_patches():
@@ -181,50 +185,133 @@ def test_requeue_missing_live_reload_requests_preempts_running_request():
     assert request1.num_output_placeholders == 0
     assert request1.spec_token_ids == []
     assert request1.num_preemptions == 1
-    assert request1.discard_latest_async_tokens is False
+    assert request1.discard_latest_async_tokens is True
+
+
+def test_requeued_live_reload_request_discards_late_async_token():
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    patch_async_scheduler_preempt_discard()
+
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[Request] = []
+
+        def prepend_request(self, request):
+            self.prepended.append(request)
+
+    waiting = _WaitingQueue()
+    request = Request(
+        request_id="req-0",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        eos_token_id=0,
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 4
+    request.num_output_placeholders = 1
+    request.spec_token_ids = [7]
+    request.discard_latest_async_tokens = True
+
+    def _preempt_request(request, _timestamp):
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.spec_token_ids.clear()
+        request.num_preemptions += 1
+        waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={"req-0": request},
+        running=[request],
+        waiting=waiting,
+        prev_step_scheduled_req_ids={"req-0"},
+        _preempt_request=_preempt_request,
+    )
+    fake_async_scheduler = object.__new__(AsyncScheduler)
+    fake_async_scheduler.max_model_len = 128
+    fake_async_scheduler.kv_cache_manager = SimpleNamespace(
+        cache_blocks=lambda *args: None)
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+    new_token_ids, stopped = AsyncScheduler._update_request_with_output(
+        fake_async_scheduler,
+        request,
+        [42],
+    )
+
+    assert (new_token_ids, stopped) == ([], False)
+    assert list(request.output_token_ids) == []
+    assert request.num_output_placeholders == 0
+    assert request.discard_latest_async_tokens is False
+
+
+def test_async_scheduler_patch_discards_stale_token_without_placeholders():
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    patch_async_scheduler_preempt_discard()
+
+    request = Request(
+        request_id="req-0",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        eos_token_id=0,
+    )
+    request.status = RequestStatus.PREEMPTED
+    request.num_output_placeholders = 0
+    request.discard_latest_async_tokens = True
+
+    fake_async_scheduler = object.__new__(AsyncScheduler)
+    fake_async_scheduler.max_model_len = 128
+    fake_async_scheduler.kv_cache_manager = SimpleNamespace(
+        cache_blocks=lambda *args: None)
+
+    new_token_ids, stopped = AsyncScheduler._update_request_with_output(
+        fake_async_scheduler,
+        request,
+        [42],
+    )
+
+    assert (new_token_ids, stopped) == ([], False)
+    assert list(request.output_token_ids) == []
+    assert request.num_output_placeholders == 0
+    assert request.discard_latest_async_tokens is False
 
 
 def test_async_scheduler_patch_clears_preempt_discard_for_waiting_requests(
-    monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 
-    original_update = AsyncScheduler._update_request_with_output
-    original_installed = getattr(
-        AsyncScheduler, "_tpu_preempt_discard_patch_installed", False)
+    patch_async_scheduler_preempt_discard()
 
-    seen = {}
+    request = Request(
+        request_id="req-0",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        eos_token_id=0,
+    )
+    request.status = RequestStatus.WAITING
+    request.num_output_placeholders = 2
+    request.discard_latest_async_tokens = True
 
-    def fake_original(self, request, new_token_ids):
-        seen["discard_latest_async_tokens"] = request.discard_latest_async_tokens
-        seen["status"] = request.status
-        return list(new_token_ids), False
+    fake_async_scheduler = object.__new__(AsyncScheduler)
+    fake_async_scheduler.max_model_len = 128
+    fake_async_scheduler.kv_cache_manager = SimpleNamespace(
+        cache_blocks=lambda *args: None)
 
-    try:
-        monkeypatch.setattr(AsyncScheduler, "_update_request_with_output",
-                            fake_original)
-        AsyncScheduler._tpu_preempt_discard_patch_installed = False
-        patch_async_scheduler_preempt_discard()
+    new_token_ids, stopped = AsyncScheduler._update_request_with_output(
+        fake_async_scheduler,
+        request,
+        [11, 12],
+    )
 
-        request = SimpleNamespace(
-            discard_latest_async_tokens=True,
-            status=RequestStatus.WAITING,
-        )
-        new_token_ids, stopped = AsyncScheduler._update_request_with_output(
-            SimpleNamespace(),
-            request,
-            [11, 12],
-        )
-
-        assert (new_token_ids, stopped) == ([11, 12], False)
-        assert request.discard_latest_async_tokens is False
-        assert seen == {
-            "discard_latest_async_tokens": False,
-            "status": RequestStatus.WAITING,
-        }
-    finally:
-        AsyncScheduler._update_request_with_output = original_update
-        AsyncScheduler._tpu_preempt_discard_patch_installed = original_installed
+    assert (new_token_ids, stopped) == ([11, 12], False)
+    assert list(request.output_token_ids) == [11, 12]
+    assert request.num_output_placeholders == 0
+    assert request.discard_latest_async_tokens is False
 
 
 def test_run_with_request_admission_gate_waits_for_reload_gate():

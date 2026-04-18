@@ -5,6 +5,7 @@ import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
 
+import pytest
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponse,
     CompletionResponseChoice,
@@ -14,6 +15,8 @@ from vllm.exceptions import VLLMValidationError
 
 from tpu_inference.entrypoints import online_rl_server
 from tpu_inference.entrypoints.stacked_regex import TPUCompletionRequest
+
+pytestmark = pytest.mark.online_rl_server_related
 
 
 class _FakeRawRequest:

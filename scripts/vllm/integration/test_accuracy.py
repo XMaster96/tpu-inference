@@ -13,9 +13,12 @@ AsyncLLMEngine are working correctly.
 
 import threading
 
-import lm_eval
 import pytest
 from vllm.platforms import current_platform
+
+lm_eval = pytest.importorskip("lm_eval")
+
+pytestmark = pytest.mark.online_rl_server_related
 
 MODEL_NAMES = []
 FP8_KV_MODEL_NAMES = []

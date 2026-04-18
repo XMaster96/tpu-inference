@@ -1127,6 +1127,7 @@ class TestTPUJaxRunnerDPInputsLightweight:
             np.zeros((1, 64), dtype=np.int32),
         )
 
+    @pytest.mark.online_rl_server_related
     def test_invalidate_live_reload_state_clears_async_runner_state(self):
         self.runner.invalidate_live_reload_state = (
             TPUModelRunner.invalidate_live_reload_state.__get__(self.runner))

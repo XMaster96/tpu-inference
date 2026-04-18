@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 from flax import nnx
 from jax.sharding import Mesh
@@ -120,7 +121,7 @@ class TestJaxAutoWeightsLoader:
                                    rtol=1e-3,
                                    atol=1e-2)
 
-
+@pytest.mark.online_rl_server_related
 class TestModlaxOrbaxLlamaSupport:
 
     def test_build_modlax_llama_restore_template(self):

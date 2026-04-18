@@ -6,9 +6,12 @@ import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import pytest
 from fastapi import HTTPException
 
 from tpu_inference.entrypoints import online_rl_server
+
+pytestmark = pytest.mark.online_rl_server_related
 
 
 class _FakeEngineCore:

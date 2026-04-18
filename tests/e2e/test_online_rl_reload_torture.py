@@ -20,6 +20,8 @@ from typing import Any, Callable
 import pytest
 import requests
 
+pytestmark = pytest.mark.online_rl_server_related
+
 
 DEFAULT_ORBAX_CHECKPOINT = (
     "gs://ml-flops-checkpoints-us-central2/"

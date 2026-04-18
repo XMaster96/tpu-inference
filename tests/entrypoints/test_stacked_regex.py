@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from http import HTTPStatus
 from types import SimpleNamespace
 
+import pytest
 import llguidance
 import llguidance.hf as llguidance_hf
 from pydantic import ValidationError
@@ -36,6 +37,8 @@ from tpu_inference.entrypoints.stacked_regex import (
     normalize_completion_request,
     validate_stacked_regexes,
 )
+
+pytestmark = pytest.mark.online_rl_server_related
 
 
 class _FakeRawRequest:
