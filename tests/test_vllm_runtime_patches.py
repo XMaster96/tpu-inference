@@ -247,6 +247,43 @@ def test_requeued_live_reload_request_discards_late_async_token():
     assert request.discard_latest_async_tokens is False
 
 
+def test_requeue_missing_live_reload_requests_is_idempotent_for_waiting_request():
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[object] = []
+
+        def prepend_request(self, request):
+            self.prepended.append(request)
+
+    waiting = _WaitingQueue()
+    request = SimpleNamespace(
+        request_id="req-0",
+        status=RequestStatus.PREEMPTED,
+        num_computed_tokens=0,
+        num_output_placeholders=0,
+        spec_token_ids=[],
+        num_preemptions=1,
+        discard_latest_async_tokens=True,
+    )
+    waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={"req-0": request},
+        running=[],
+        waiting=waiting,
+        prev_step_scheduled_req_ids=set(),
+        _preempt_request=lambda *_args: None,
+    )
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    assert waiting.prepended == [request]
+    assert request.num_preemptions == 1
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_output_placeholders == 0
+
+
 def test_async_scheduler_patch_discards_stale_token_without_placeholders():
     from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 

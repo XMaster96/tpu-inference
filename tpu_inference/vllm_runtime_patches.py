@@ -167,8 +167,20 @@ def requeue_missing_live_reload_requests(
             except ValueError:
                 pass
 
+        request_status = getattr(request, "status", None)
+        already_preempted = (
+            RequestStatus is not None
+            and request_status == RequestStatus.PREEMPTED
+        )
+        already_waiting = (
+            RequestStatus is not None
+            and request_status == RequestStatus.WAITING
+        )
+
         if callable(preempt_request) and removed_from_running:
             preempt_request(request, timestamp)
+        elif already_preempted or already_waiting:
+            pass
         else:
             if RequestStatus is not None:
                 request.status = RequestStatus.PREEMPTED

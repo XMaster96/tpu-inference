@@ -189,6 +189,45 @@ async def _set_generation_paused(engine: EngineClient, paused: bool) -> bool:
         return was_paused
 
 
+async def _run_with_reload_timeout(
+    operation,
+    *,
+    step_name: str,
+    timeout_seconds: float,
+):
+    try:
+        return await asyncio.wait_for(operation, timeout=timeout_seconds)
+    except TimeoutError as exc:
+        raise RuntimeError(
+            f"timeout while {step_name} after {timeout_seconds:.2f}s"
+        ) from exc
+
+
+def _engine_has_unfinished_requests(engine: EngineClient) -> bool:
+    engine_state = vars(engine)
+
+    output_processor = engine_state.get("output_processor")
+    has_unfinished_requests = getattr(
+        output_processor,
+        "has_unfinished_requests",
+        None,
+    )
+    if callable(has_unfinished_requests):
+        return bool(has_unfinished_requests())
+
+    for attr_name in ("running_requests", "waiting_requests"):
+        request_container = engine_state.get(attr_name)
+        if request_container is None:
+            continue
+        try:
+            if len(request_container) > 0:
+                return True
+        except TypeError:
+            return True
+
+    return False
+
+
 async def _preempt_running_requests(engine: EngineClient) -> None:
     """Force-preempt all running requests and clear their prefix-KV state."""
     reset_ok = await engine.reset_prefix_cache(
@@ -368,9 +407,13 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
         async with _get_request_admission_lock(app_state):
             try:
                 if payload.wait_for_inflight_requests:
-                    await engine.pause_generation(
-                        wait_for_inflight_requests=True,
-                        clear_cache=payload.clear_cache,
+                    await _run_with_reload_timeout(
+                        engine.pause_generation(
+                            wait_for_inflight_requests=True,
+                            clear_cache=payload.clear_cache,
+                        ),
+                        step_name="pausing generation for live reload",
+                        timeout_seconds=payload.timeout_seconds,
                     )
                     used_pause_generation = True
                 else:
@@ -381,37 +424,73 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
 
                     # Invalidate any async TPU decode state before preempting so
                     # stale in-flight outputs are dropped at the reload boundary.
-                    await _invalidate_live_reload_worker_state(
-                        engine,
+                    await _run_with_reload_timeout(
+                        _invalidate_live_reload_worker_state(
+                            engine,
+                            timeout_seconds=payload.timeout_seconds,
+                        ),
+                        step_name=(
+                            "invalidating live-reload worker state before "
+                            "preemption"
+                        ),
                         timeout_seconds=payload.timeout_seconds,
                     )
                     # Preempt running requests instead of aborting them. This keeps
                     # per-request state (including structured-output FSM progression)
                     # while forcing KV recomputation under the new weights.
-                    await _preempt_running_requests(engine)
+                    await _run_with_reload_timeout(
+                        _preempt_running_requests(engine),
+                        step_name="preempting running requests",
+                        timeout_seconds=payload.timeout_seconds,
+                    )
 
                 rpc_args = (
                     (payload.checkpoint_path,)
                     if payload.checkpoint_path is not None
                     else ()
                 )
-                worker_results = await engine.collective_rpc(
-                    method="reload_model_weights",
-                    timeout=payload.timeout_seconds,
-                    args=rpc_args,
-                    kwargs={"release_kv_cache": payload.release_kv_cache},
+                worker_results = await _run_with_reload_timeout(
+                    engine.collective_rpc(
+                        method="reload_model_weights",
+                        timeout=payload.timeout_seconds,
+                        args=rpc_args,
+                        kwargs={"release_kv_cache": payload.release_kv_cache},
+                    ),
+                    step_name="reloading model weights",
+                    timeout_seconds=payload.timeout_seconds,
                 )
 
                 if manual_pause_mode:
-                    await _invalidate_live_reload_worker_state(
-                        engine,
+                    await _run_with_reload_timeout(
+                        _invalidate_live_reload_worker_state(
+                            engine,
+                            timeout_seconds=payload.timeout_seconds,
+                        ),
+                        step_name=(
+                            "invalidating live-reload worker state after reload"
+                        ),
                         timeout_seconds=payload.timeout_seconds,
                     )
                     # Re-preempt after reload so request scheduler state stays
                     # consistent with freshly reinitialized worker KV caches.
-                    await _preempt_running_requests(engine)
+                    await _run_with_reload_timeout(
+                        _preempt_running_requests(engine),
+                        step_name="preempting requests after reload",
+                        timeout_seconds=payload.timeout_seconds,
+                    )
                     if payload.clear_cache:
-                        await engine.reset_mm_cache()
+                        if _engine_has_unfinished_requests(engine):
+                            logger.warning(
+                                "Skipping multi-modal cache reset during live "
+                                "reload because requests remain in progress "
+                                "after preemption."
+                            )
+                        else:
+                            await _run_with_reload_timeout(
+                                engine.reset_mm_cache(),
+                                step_name="resetting the multi-modal cache",
+                                timeout_seconds=payload.timeout_seconds,
+                            )
             except Exception as exc:
                 logger.exception("Live model reload failed")
                 raise HTTPException(

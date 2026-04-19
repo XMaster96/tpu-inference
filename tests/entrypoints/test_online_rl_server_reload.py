@@ -172,6 +172,30 @@ class _StressEngine(_FakeEngine):
             self.rpc_inflight -= 1
 
 
+class _MMCacheRecordingStressEngine(_StressEngine):
+
+    def __init__(self):
+        super().__init__()
+        self.mm_cache_call_request_counts: list[tuple[int, int]] = []
+
+    async def reset_mm_cache(self):
+        self.mm_cache_call_request_counts.append(
+            (len(self.running_requests), len(self.waiting_requests)))
+        await super().reset_mm_cache()
+
+
+class _SlowPreemptEngine(_FakeEngine):
+
+    def __init__(self, sleep_seconds: float):
+        super().__init__()
+        self.sleep_seconds = sleep_seconds
+
+    async def reset_prefix_cache(self, **kwargs):
+        self.reset_prefix_cache_calls.append(kwargs)
+        await asyncio.sleep(self.sleep_seconds)
+        return self._reset_prefix_cache_result
+
+
 class TestReloadWeightsEndpoint(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
@@ -618,6 +642,53 @@ class TestReloadWeightsStress(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine._paused)
         self.assertEqual(app_state.current_checkpoint_path, "ckpt-7")
         self.assertTrue(app_state.first_weights_loaded.is_set())
+
+    async def test_preempt_mode_does_not_reset_mm_cache_with_preempted_requests(
+            self):
+        engine = _MMCacheRecordingStressEngine()
+        app_state, raw_request = self._build_request(engine)
+        req = _StressRequestState(
+            request_id="req-mm-cache",
+            prompt_text="prompt",
+            prompt_token_ids=[1, 2, 3],
+            regex_tracker=_RegexTracker(regex=r"^.*$"),
+        )
+        engine.add_request_state(req)
+
+        payload = online_rl_server.ReloadWeightsRequest(
+            checkpoint_path="new-ckpt",
+            wait_for_inflight_requests=False,
+            clear_cache=True,
+            release_kv_cache=True,
+            timeout_seconds=30.0,
+        )
+
+        response = await online_rl_server.reload_weights(payload, raw_request)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("req-mm-cache", engine.waiting_requests)
+        self.assertEqual(engine.reset_mm_cache_calls, 0)
+        self.assertEqual(engine.mm_cache_call_request_counts, [])
+        self.assertEqual(app_state.current_checkpoint_path, "new-ckpt")
+
+    async def test_preempt_mode_times_out_if_prefix_cache_reset_stalls(self):
+        engine = _SlowPreemptEngine(sleep_seconds=1.0)
+        _app_state, raw_request = TestReloadWeightsEndpoint._build_request(engine)
+        payload = online_rl_server.ReloadWeightsRequest(
+            checkpoint_path="new-ckpt",
+            wait_for_inflight_requests=False,
+            clear_cache=True,
+            release_kv_cache=True,
+            timeout_seconds=0.01,
+        )
+
+        with self.assertRaises(HTTPException) as cm:
+            await asyncio.wait_for(
+                online_rl_server.reload_weights(payload, raw_request),
+                timeout=0.2,
+            )
+
+        self.assertIn("timeout", cm.exception.detail.lower())
 
     async def test_concurrent_reload_storm_serializes_and_does_not_break_state(self):
         engine = _StressEngine(rpc_delay_seconds=0.03)
