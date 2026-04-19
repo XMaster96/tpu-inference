@@ -154,6 +154,15 @@ def requeue_missing_live_reload_requests(
     except Exception:
         RequestStatus = None
 
+    def _is_in_waiting_queue(request) -> bool:
+        if waiting is None:
+            return False
+
+        try:
+            return any(queued_request is request for queued_request in waiting)
+        except TypeError:
+            return False
+
     for req_id in missing_req_ids:
         request = getattr(scheduler, "requests", {}).get(req_id)
         if request is None:
@@ -180,7 +189,10 @@ def requeue_missing_live_reload_requests(
         if callable(preempt_request) and removed_from_running:
             preempt_request(request, timestamp)
         elif already_preempted or already_waiting:
-            pass
+            if not _is_in_waiting_queue(request) and hasattr(
+                waiting, "prepend_request"
+            ):
+                waiting.prepend_request(request)
         else:
             if RequestStatus is not None:
                 request.status = RequestStatus.PREEMPTED
