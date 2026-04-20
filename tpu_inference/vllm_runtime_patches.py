@@ -13,6 +13,131 @@ _T = TypeVar("_T")
 _DEBUG_RELOAD_RACE = os.environ.get("TPU_DEBUG_RELOAD_RACE") == "1"
 
 
+def _safe_len(value) -> int | None:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _truncate_values(values, limit: int = 8) -> list[object]:
+    values = list(values)
+    if len(values) <= limit:
+        return values
+    return values[:limit] + [f"...(+{len(values) - limit} more)"]
+
+
+def _request_id_sample(requests, limit: int = 8) -> list[str]:
+    if requests is None:
+        return []
+
+    try:
+        if isinstance(requests, dict):
+            request_ids = [str(req_id) for req_id in requests.keys()]
+        else:
+            request_ids = [
+                str(getattr(request, "request_id", request))
+                for request in requests
+            ]
+    except Exception as exc:
+        return [f"<unavailable:{type(exc).__name__}>"]
+
+    return [str(value) for value in _truncate_values(request_ids, limit=limit)]
+
+
+def _request_state_summary(request) -> dict[str, object]:
+    return {
+        "status": str(getattr(request, "status", None)),
+        "num_computed_tokens": getattr(request, "num_computed_tokens", None),
+        "num_output_placeholders": getattr(
+            request, "num_output_placeholders", None),
+        "num_preemptions": getattr(request, "num_preemptions", None),
+        "discard_latest_async_tokens": getattr(
+            request, "discard_latest_async_tokens", None),
+    }
+
+
+def _scheduler_state_snapshot(scheduler) -> dict[str, object]:
+    return {
+        "reload_generation": get_reload_generation(scheduler),
+        "request_count": _safe_len(getattr(scheduler, "requests", None)),
+        "waiting_count": _safe_len(getattr(scheduler, "waiting", None)),
+        "running_count": _safe_len(getattr(scheduler, "running", None)),
+        "waiting_ids": _request_id_sample(getattr(scheduler, "waiting", None)),
+        "running_ids": _request_id_sample(getattr(scheduler, "running", None)),
+        "prev_step_scheduled_req_count": _safe_len(
+            getattr(scheduler, "prev_step_scheduled_req_ids", None)
+        ),
+    }
+
+
+def _request_context_snapshot(
+    scheduler,
+    request_ids,
+    *,
+    limit: int = 4,
+) -> dict[str, dict[str, object]]:
+    requests = getattr(scheduler, "requests", {}) or {}
+    context: dict[str, dict[str, object]] = {}
+    for request_id in list(request_ids)[:limit]:
+        request = requests.get(request_id)
+        if request is None:
+            context[str(request_id)] = {"status": "<missing-request-object>"}
+            continue
+        context[str(request_id)] = _request_state_summary(request)
+    omitted = len(tuple(request_ids)) - len(context)
+    if omitted > 0:
+        context["..."] = {"omitted_requests": omitted}
+    return context
+
+
+def _should_log_reload_event_context(
+    scheduler,
+    event_name: str,
+    request_ids,
+) -> bool:
+    logged_events = getattr(scheduler, "_tpu_reload_event_context_logged", None)
+    if logged_events is None:
+        logged_events = set()
+        setattr(scheduler, "_tpu_reload_event_context_logged", logged_events)
+
+    key = (
+        event_name,
+        get_reload_generation(scheduler),
+        tuple(str(request_id) for request_id in request_ids),
+    )
+    if key in logged_events:
+        return False
+
+    if len(logged_events) >= 256:
+        logged_events.clear()
+    logged_events.add(key)
+    return True
+
+
+def _log_reload_event_context_once(
+    scheduler,
+    *,
+    event_name: str,
+    request_ids,
+    message: str,
+    extra: dict[str, object] | None = None,
+) -> None:
+    if not _should_log_reload_event_context(scheduler, event_name, request_ids):
+        return
+
+    logger.warning(
+        "%s | request_ids=%s | scheduler=%s | request_context=%s | extra=%s",
+        message,
+        tuple(str(request_id) for request_id in request_ids),
+        _scheduler_state_snapshot(scheduler),
+        _request_context_snapshot(scheduler, request_ids),
+        extra or {},
+    )
+
+
 def get_reload_generation(scheduler) -> int:
     return int(getattr(scheduler, "_tpu_reload_generation", 0))
 
@@ -135,9 +260,9 @@ def filter_scheduler_output_missing_req_indices(
 def requeue_missing_live_reload_requests(
     scheduler,
     missing_req_ids,
-) -> None:
+) -> list[dict[str, object]]:
     if not missing_req_ids:
-        return
+        return []
 
     prev_step_scheduled_req_ids = getattr(
         scheduler, "prev_step_scheduled_req_ids", None)
@@ -163,12 +288,15 @@ def requeue_missing_live_reload_requests(
         except TypeError:
             return False
 
+    requeue_actions: list[dict[str, object]] = []
+
     for req_id in missing_req_ids:
         request = getattr(scheduler, "requests", {}).get(req_id)
         if request is None:
             continue
 
         removed_from_running = False
+        was_in_waiting = _is_in_waiting_queue(request)
         if isinstance(running, list):
             try:
                 running.remove(request)
@@ -188,11 +316,15 @@ def requeue_missing_live_reload_requests(
 
         if callable(preempt_request) and removed_from_running:
             preempt_request(request, timestamp)
+            action = "preempt_running"
         elif already_preempted or already_waiting:
             if not _is_in_waiting_queue(request) and hasattr(
                 waiting, "prepend_request"
             ):
                 waiting.prepend_request(request)
+                action = "restore_waiting_queue"
+            else:
+                action = "preserve_waiting_queue"
         else:
             if RequestStatus is not None:
                 request.status = RequestStatus.PREEMPTED
@@ -204,11 +336,25 @@ def requeue_missing_live_reload_requests(
                 request.num_preemptions += 1
             if hasattr(waiting, "prepend_request"):
                 waiting.prepend_request(request)
+            action = "mark_preempted_and_prepend"
 
         if hasattr(request, "num_output_placeholders"):
             request.num_output_placeholders = 0
         if hasattr(request, "discard_latest_async_tokens"):
             request.discard_latest_async_tokens = True
+
+        requeue_actions.append(
+            {
+                "request_id": str(req_id),
+                "action": action,
+                "removed_from_running": removed_from_running,
+                "was_in_waiting": was_in_waiting,
+                "is_in_waiting": _is_in_waiting_queue(request),
+                **_request_state_summary(request),
+            }
+        )
+
+    return requeue_actions
 
 
 def patch_async_scheduler_preempt_discard() -> None:
@@ -363,7 +509,16 @@ def patch_scheduler_reload_stale_output() -> None:
         reset_running_requests = bool(kwargs.get("reset_running_requests", False))
         if args:
             reset_running_requests = bool(args[0])
-        if _DEBUG_RELOAD_RACE:
+        previous_generation = get_reload_generation(self)
+        if reset_running_requests:
+            logger.info(
+                "Scheduler.reset_prefix_cache start for live reload | "
+                "reset_running=%s | reload_generation=%s | scheduler=%s",
+                reset_running_requests,
+                previous_generation,
+                _scheduler_state_snapshot(self),
+            )
+        elif _DEBUG_RELOAD_RACE:
             logger.warning(
                 "Scheduler.reset_prefix_cache start | reset_running=%s | "
                 "waiting=%s | running=%s | requests=%s",
@@ -374,8 +529,19 @@ def patch_scheduler_reload_stale_output() -> None:
             )
         reset_ok = original_reset_prefix_cache(self, *args, **kwargs)
         if reset_running_requests and reset_ok:
-            self._tpu_reload_generation = get_reload_generation(self) + 1
-        if _DEBUG_RELOAD_RACE:
+            self._tpu_reload_generation = previous_generation + 1
+        if reset_running_requests:
+            logger.info(
+                "Scheduler.reset_prefix_cache done for live reload | "
+                "reset_running=%s | reset_ok=%s | reload_generation=%s->%s | "
+                "scheduler=%s",
+                reset_running_requests,
+                reset_ok,
+                previous_generation,
+                get_reload_generation(self),
+                _scheduler_state_snapshot(self),
+            )
+        elif _DEBUG_RELOAD_RACE:
             logger.warning(
                 "Scheduler.reset_prefix_cache done | reset_running=%s | "
                 "reset_ok=%s | waiting=%s | running=%s | requests=%s",
@@ -393,6 +559,14 @@ def patch_scheduler_reload_stale_output() -> None:
                 getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
             )
             if stale_req_ids:
+                _log_reload_event_context_once(
+                    self,
+                    event_name="stale_scheduler_output",
+                    request_ids=stale_req_ids,
+                    message=(
+                        "Live reload stale scheduler output context"
+                    ),
+                )
                 logger.warning(
                     "Dropping stale scheduler output after live reload preemption "
                     "for request ids: %s",
@@ -407,7 +581,24 @@ def patch_scheduler_reload_stale_output() -> None:
             )
         )
         if missing_req_ids:
-            requeue_missing_live_reload_requests(self, missing_req_ids)
+            requeue_actions = requeue_missing_live_reload_requests(
+                self,
+                missing_req_ids,
+            )
+            _log_reload_event_context_once(
+                self,
+                event_name="missing_request_indices",
+                request_ids=missing_req_ids,
+                message=(
+                    "Live reload stale model output context"
+                ),
+                extra={
+                    "requeue_actions": _truncate_values(requeue_actions, limit=4),
+                    "model_runner_req_ids": _request_id_sample(
+                        getattr(model_runner_output, "req_id_to_index", {}),
+                    ),
+                },
+            )
             logger.warning(
                 "Dropping stale model output entries missing request indices "
                 "after live reload preemption for request ids: %s",

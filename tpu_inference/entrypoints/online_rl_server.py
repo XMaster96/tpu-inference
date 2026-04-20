@@ -3,6 +3,8 @@
 import asyncio
 import importlib
 import inspect
+import time
+import uuid
 from argparse import Namespace
 from http import HTTPStatus
 
@@ -201,6 +203,153 @@ async def _run_with_reload_timeout(
         raise RuntimeError(
             f"timeout while {step_name} after {timeout_seconds:.2f}s"
         ) from exc
+
+
+def _safe_len(value) -> int | None:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return None
+
+
+def _truncate_values(values, limit: int = 8) -> list[object]:
+    values = list(values)
+    if len(values) <= limit:
+        return values
+    return values[:limit] + [f"...(+{len(values) - limit} more)"]
+
+
+def _request_id_sample(requests, limit: int = 8) -> list[str]:
+    if requests is None:
+        return []
+
+    try:
+        if isinstance(requests, dict):
+            request_ids = [str(request_id) for request_id in requests.keys()]
+        else:
+            request_ids = [
+                str(getattr(request, "request_id", request))
+                for request in requests
+            ]
+    except Exception as exc:
+        return [f"<unavailable:{type(exc).__name__}>"]
+
+    return [str(value) for value in _truncate_values(request_ids, limit=limit)]
+
+
+def _engine_state_snapshot(engine: EngineClient) -> dict[str, object]:
+    engine_state = vars(engine)
+    output_processor = engine_state.get("output_processor")
+    has_unfinished_requests = getattr(
+        output_processor,
+        "has_unfinished_requests",
+        None,
+    )
+    unfinished_requests: bool | str | None = None
+    if callable(has_unfinished_requests):
+        try:
+            unfinished_requests = bool(has_unfinished_requests())
+        except Exception as exc:
+            unfinished_requests = f"<error:{type(exc).__name__}>"
+
+    return {
+        "paused": getattr(engine, "_paused", None),
+        "running_count": _safe_len(engine_state.get("running_requests")),
+        "waiting_count": _safe_len(engine_state.get("waiting_requests")),
+        "running_ids": _request_id_sample(engine_state.get("running_requests")),
+        "waiting_ids": _request_id_sample(engine_state.get("waiting_requests")),
+        "has_unfinished_requests": unfinished_requests,
+    }
+
+
+def _summarize_worker_results(worker_results) -> dict[str, object]:
+    if isinstance(worker_results, dict):
+        entries = list(worker_results.items())
+    elif isinstance(worker_results, list):
+        entries = list(enumerate(worker_results))
+    else:
+        return {
+            "type": type(worker_results).__name__,
+            "value": repr(worker_results),
+        }
+
+    summarized_entries: list[dict[str, object]] = []
+    for worker, result in entries[:4]:
+        if isinstance(result, dict):
+            summary = {
+                key: result[key]
+                for key in (
+                    "status",
+                    "mode",
+                    "checkpoint_path",
+                    "loaded_checkpoint_path",
+                    "weight_load_seconds",
+                    "compile_seconds",
+                    "load_seconds",
+                    "total_seconds",
+                )
+                if key in result
+            }
+            if not summary:
+                summary = {"keys": _truncate_values(sorted(result.keys()), limit=8)}
+        else:
+            summary = {
+                "type": type(result).__name__,
+                "value": repr(result),
+            }
+        summarized_entries.append({"worker": worker, "result": summary})
+
+    return {
+        "worker_count": len(entries),
+        "sample": summarized_entries,
+        "omitted_workers": max(0, len(entries) - len(summarized_entries)),
+    }
+
+
+async def _run_reload_phase(
+    operation,
+    *,
+    engine: EngineClient,
+    reload_id: str,
+    phase_name: str,
+    timeout_seconds: float,
+):
+    started_at = time.monotonic()
+    logger.info(
+        "Live reload phase start | reload_id=%s | phase=%s | engine=%s",
+        reload_id,
+        phase_name,
+        _engine_state_snapshot(engine),
+    )
+    try:
+        result = await _run_with_reload_timeout(
+            operation,
+            step_name=phase_name,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        logger.error(
+            "Live reload phase failed | reload_id=%s | phase=%s | elapsed=%.3fs "
+            "| error=%s | engine=%s",
+            reload_id,
+            phase_name,
+            time.monotonic() - started_at,
+            exc,
+            _engine_state_snapshot(engine),
+        )
+        raise
+
+    logger.info(
+        "Live reload phase done | reload_id=%s | phase=%s | elapsed=%.3fs | "
+        "engine=%s",
+        reload_id,
+        phase_name,
+        time.monotonic() - started_at,
+        _engine_state_snapshot(engine),
+    )
+    return result
 
 
 def _engine_has_unfinished_requests(engine: EngineClient) -> bool:
@@ -402,17 +551,42 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
     manual_pause_mode = False
     should_unpause_manually = False
     used_pause_generation = False
+    reload_id = uuid.uuid4().hex[:8]
+    reload_started_at = time.monotonic()
+    current_phase = "acquiring_reload_lock"
+    current_checkpoint_path = app_state.current_checkpoint_path
+    target_checkpoint_path = payload.checkpoint_path or current_checkpoint_path
 
     async with app_state.reload_lock:
         async with _get_request_admission_lock(app_state):
+            logger.info(
+                "Live reload requested | reload_id=%s | mode=%s | "
+                "current_checkpoint=%s | target_checkpoint=%s | clear_cache=%s | "
+                "release_kv_cache=%s | timeout_seconds=%.2f | engine=%s",
+                reload_id,
+                (
+                    "wait_for_inflight_requests"
+                    if payload.wait_for_inflight_requests
+                    else "preempt_inflight_requests"
+                ),
+                current_checkpoint_path,
+                target_checkpoint_path,
+                payload.clear_cache,
+                payload.release_kv_cache,
+                payload.timeout_seconds,
+                _engine_state_snapshot(engine),
+            )
             try:
                 if payload.wait_for_inflight_requests:
-                    await _run_with_reload_timeout(
+                    current_phase = "pausing generation for live reload"
+                    await _run_reload_phase(
                         engine.pause_generation(
                             wait_for_inflight_requests=True,
                             clear_cache=payload.clear_cache,
                         ),
-                        step_name="pausing generation for live reload",
+                        engine=engine,
+                        reload_id=reload_id,
+                        phase_name=current_phase,
                         timeout_seconds=payload.timeout_seconds,
                     )
                     used_pause_generation = True
@@ -424,23 +598,28 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
 
                     # Invalidate any async TPU decode state before preempting so
                     # stale in-flight outputs are dropped at the reload boundary.
-                    await _run_with_reload_timeout(
+                    current_phase = (
+                        "invalidating live-reload worker state before preemption"
+                    )
+                    await _run_reload_phase(
                         _invalidate_live_reload_worker_state(
                             engine,
                             timeout_seconds=payload.timeout_seconds,
                         ),
-                        step_name=(
-                            "invalidating live-reload worker state before "
-                            "preemption"
-                        ),
+                        engine=engine,
+                        reload_id=reload_id,
+                        phase_name=current_phase,
                         timeout_seconds=payload.timeout_seconds,
                     )
                     # Preempt running requests instead of aborting them. This keeps
                     # per-request state (including structured-output FSM progression)
                     # while forcing KV recomputation under the new weights.
-                    await _run_with_reload_timeout(
+                    current_phase = "preempting running requests"
+                    await _run_reload_phase(
                         _preempt_running_requests(engine),
-                        step_name="preempting running requests",
+                        engine=engine,
+                        reload_id=reload_id,
+                        phase_name=current_phase,
                         timeout_seconds=payload.timeout_seconds,
                     )
 
@@ -449,33 +628,40 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                     if payload.checkpoint_path is not None
                     else ()
                 )
-                worker_results = await _run_with_reload_timeout(
+                current_phase = "reloading model weights"
+                worker_results = await _run_reload_phase(
                     engine.collective_rpc(
                         method="reload_model_weights",
                         timeout=payload.timeout_seconds,
                         args=rpc_args,
                         kwargs={"release_kv_cache": payload.release_kv_cache},
                     ),
-                    step_name="reloading model weights",
+                    engine=engine,
+                    reload_id=reload_id,
+                    phase_name=current_phase,
                     timeout_seconds=payload.timeout_seconds,
                 )
 
                 if manual_pause_mode:
-                    await _run_with_reload_timeout(
+                    current_phase = "invalidating live-reload worker state after reload"
+                    await _run_reload_phase(
                         _invalidate_live_reload_worker_state(
                             engine,
                             timeout_seconds=payload.timeout_seconds,
                         ),
-                        step_name=(
-                            "invalidating live-reload worker state after reload"
-                        ),
+                        engine=engine,
+                        reload_id=reload_id,
+                        phase_name=current_phase,
                         timeout_seconds=payload.timeout_seconds,
                     )
                     # Re-preempt after reload so request scheduler state stays
                     # consistent with freshly reinitialized worker KV caches.
-                    await _run_with_reload_timeout(
+                    current_phase = "preempting requests after reload"
+                    await _run_reload_phase(
                         _preempt_running_requests(engine),
-                        step_name="preempting requests after reload",
+                        engine=engine,
+                        reload_id=reload_id,
+                        phase_name=current_phase,
                         timeout_seconds=payload.timeout_seconds,
                     )
                     if payload.clear_cache:
@@ -483,16 +669,31 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                             logger.warning(
                                 "Skipping multi-modal cache reset during live "
                                 "reload because requests remain in progress "
-                                "after preemption."
+                                "after preemption | reload_id=%s | engine=%s",
+                                reload_id,
+                                _engine_state_snapshot(engine),
                             )
                         else:
-                            await _run_with_reload_timeout(
+                            current_phase = "resetting the multi-modal cache"
+                            await _run_reload_phase(
                                 engine.reset_mm_cache(),
-                                step_name="resetting the multi-modal cache",
+                                engine=engine,
+                                reload_id=reload_id,
+                                phase_name=current_phase,
                                 timeout_seconds=payload.timeout_seconds,
                             )
             except Exception as exc:
-                logger.exception("Live model reload failed")
+                logger.exception(
+                    "Live model reload failed | reload_id=%s | phase=%s | "
+                    "elapsed=%.3fs | current_checkpoint=%s | "
+                    "target_checkpoint=%s | engine=%s",
+                    reload_id,
+                    current_phase,
+                    time.monotonic() - reload_started_at,
+                    current_checkpoint_path,
+                    target_checkpoint_path,
+                    _engine_state_snapshot(engine),
+                )
                 raise HTTPException(
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
                     detail=f"Live model reload failed: {exc}",
@@ -501,12 +702,34 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                 if manual_pause_mode:
                     if should_unpause_manually:
                         await _set_generation_paused(engine, False)
+                        logger.info(
+                            "Live reload manual pause released | reload_id=%s | "
+                            "engine=%s",
+                            reload_id,
+                            _engine_state_snapshot(engine),
+                        )
                 elif used_pause_generation:
                     await engine.resume_generation()
+                    logger.info(
+                        "Live reload generation resumed | reload_id=%s | "
+                        "engine=%s",
+                        reload_id,
+                        _engine_state_snapshot(engine),
+                    )
 
         if payload.checkpoint_path is not None:
             app_state.current_checkpoint_path = payload.checkpoint_path
         app_state.first_weights_loaded.set()
+
+    logger.info(
+        "Live reload completed | reload_id=%s | elapsed=%.3fs | "
+        "checkpoint_path=%s | worker_results=%s | engine=%s",
+        reload_id,
+        time.monotonic() - reload_started_at,
+        app_state.current_checkpoint_path,
+        _summarize_worker_results(worker_results),
+        _engine_state_snapshot(engine),
+    )
 
     return JSONResponse(
         content={
