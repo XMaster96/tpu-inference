@@ -556,9 +556,25 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
     current_phase = "acquiring_reload_lock"
     current_checkpoint_path = app_state.current_checkpoint_path
     target_checkpoint_path = payload.checkpoint_path or current_checkpoint_path
+    reload_lock_wait_started_at = time.monotonic()
 
     async with app_state.reload_lock:
+        reload_lock_wait_seconds = time.monotonic() - reload_lock_wait_started_at
+        request_gate_wait_started_at = time.monotonic()
         async with _get_request_admission_lock(app_state):
+            request_gate_wait_seconds = (
+                time.monotonic() - request_gate_wait_started_at
+            )
+            logger.info(
+                "Live reload orchestration start | reload_id=%s | "
+                "reload_lock_wait=%.3fs | request_gate_wait=%.3fs | ready=%s "
+                "| engine=%s",
+                reload_id,
+                reload_lock_wait_seconds,
+                request_gate_wait_seconds,
+                _weights_ready(app_state),
+                _engine_state_snapshot(engine),
+            )
             logger.info(
                 "Live reload requested | reload_id=%s | mode=%s | "
                 "current_checkpoint=%s | target_checkpoint=%s | clear_cache=%s | "
@@ -595,6 +611,14 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                     manual_pause_mode = True
                     was_paused = await _set_generation_paused(engine, True)
                     should_unpause_manually = not was_paused
+                    logger.info(
+                        "Live reload manual pause engaged | reload_id=%s | "
+                        "was_paused=%s | should_unpause=%s | engine=%s",
+                        reload_id,
+                        was_paused,
+                        should_unpause_manually,
+                        _engine_state_snapshot(engine),
+                    )
 
                     # Invalidate any async TPU decode state before preempting so
                     # stale in-flight outputs are dropped at the reload boundary.
@@ -720,6 +744,14 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
         if payload.checkpoint_path is not None:
             app_state.current_checkpoint_path = payload.checkpoint_path
         app_state.first_weights_loaded.set()
+        logger.info(
+            "Live reload state committed | reload_id=%s | checkpoint_path=%s | "
+            "first_weights_loaded=%s | ready=%s",
+            reload_id,
+            app_state.current_checkpoint_path,
+            app_state.first_weights_loaded.is_set(),
+            _weights_ready(app_state),
+        )
 
     logger.info(
         "Live reload completed | reload_id=%s | elapsed=%.3fs | "

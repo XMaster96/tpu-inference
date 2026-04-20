@@ -328,6 +328,199 @@ def test_requeue_missing_live_reload_requests_restores_orphaned_preempted_reques
     assert request.discard_latest_async_tokens is True
 
 
+def test_requeue_missing_live_reload_requests_resets_stale_waiting_request_state():
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[object] = []
+
+        def prepend_request(self, request):
+            self.prepended.append(request)
+
+        def __iter__(self):
+            return iter(self.prepended)
+
+    waiting = _WaitingQueue()
+    request = SimpleNamespace(
+        request_id="req-0",
+        status=RequestStatus.PREEMPTED,
+        num_computed_tokens=128,
+        num_output_placeholders=3,
+        spec_token_ids=[7, 8],
+        num_preemptions=1,
+        discard_latest_async_tokens=False,
+    )
+    waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={"req-0": request},
+        running=[],
+        waiting=waiting,
+        prev_step_scheduled_req_ids={"req-0"},
+        _preempt_request=lambda *_args: None,
+        _tpu_reload_generation=2,
+    )
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    assert waiting.prepended == [request]
+    assert scheduler.prev_step_scheduled_req_ids == set()
+    assert request.num_computed_tokens == 0
+    assert request.spec_token_ids == []
+    assert request.num_output_placeholders == 0
+    assert request.num_preemptions == 1
+    assert request.discard_latest_async_tokens is True
+
+
+def test_requeue_missing_live_reload_requests_is_idempotent_within_reload_generation():
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[object] = []
+
+        def prepend_request(self, request):
+            if request not in self.prepended:
+                self.prepended.append(request)
+
+        def remove(self, request):
+            self.prepended.remove(request)
+
+        def __iter__(self):
+            return iter(self.prepended)
+
+    waiting = _WaitingQueue()
+    request = SimpleNamespace(
+        request_id="req-0",
+        status=RequestStatus.RUNNING,
+        num_computed_tokens=64,
+        num_output_placeholders=1,
+        spec_token_ids=[3],
+        num_preemptions=0,
+        discard_latest_async_tokens=False,
+    )
+    preempt_calls: list[int] = []
+
+    def _preempt_request(request, _timestamp):
+        preempt_calls.append(request.num_preemptions)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.spec_token_ids.clear()
+        request.num_preemptions += 1
+        waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={"req-0": request},
+        running=[request],
+        waiting=waiting,
+        prev_step_scheduled_req_ids={"req-0"},
+        _preempt_request=_preempt_request,
+        _tpu_reload_generation=4,
+    )
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    waiting.remove(request)
+    scheduler.running.append(request)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 17
+    request.num_output_placeholders = 2
+    request.spec_token_ids = [11]
+    request.discard_latest_async_tokens = False
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    assert preempt_calls == [0]
+    assert request.num_preemptions == 1
+    assert scheduler.running == []
+    assert waiting.prepended == [request]
+    assert request.status == RequestStatus.PREEMPTED
+    assert request.num_computed_tokens == 0
+    assert request.spec_token_ids == []
+    assert request.num_output_placeholders == 0
+    assert request.discard_latest_async_tokens is True
+
+
+def test_requeue_missing_live_reload_requests_allows_resume_after_stale_output_wave():
+    from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+    patch_async_scheduler_preempt_discard()
+
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[Request] = []
+
+        def prepend_request(self, request):
+            if request not in self.prepended:
+                self.prepended.append(request)
+
+        def remove(self, request):
+            self.prepended.remove(request)
+
+        def __iter__(self):
+            return iter(self.prepended)
+
+    waiting = _WaitingQueue()
+    request = Request(
+        request_id="req-0",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        eos_token_id=0,
+    )
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 4
+    request.num_output_placeholders = 1
+    request.spec_token_ids = [7]
+
+    def _preempt_request(request, _timestamp):
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.spec_token_ids.clear()
+        request.num_preemptions += 1
+        waiting.prepend_request(request)
+
+    scheduler = SimpleNamespace(
+        requests={"req-0": request},
+        running=[request],
+        waiting=waiting,
+        prev_step_scheduled_req_ids={"req-0"},
+        _preempt_request=_preempt_request,
+        _tpu_reload_generation=7,
+    )
+    fake_async_scheduler = object.__new__(AsyncScheduler)
+    fake_async_scheduler.max_model_len = 128
+    fake_async_scheduler.kv_cache_manager = SimpleNamespace(
+        cache_blocks=lambda *args: None)
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    waiting.remove(request)
+    scheduler.running.append(request)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = 19
+    request.num_output_placeholders = 2
+    request.spec_token_ids = [11]
+    request.discard_latest_async_tokens = False
+
+    requeue_missing_live_reload_requests(scheduler, ("req-0",))
+
+    waiting.remove(request)
+    request.status = RequestStatus.RUNNING
+    request.num_output_placeholders = 2
+
+    new_token_ids, stopped = AsyncScheduler._update_request_with_output(
+        fake_async_scheduler,
+        request,
+        [41, 42],
+    )
+
+    assert (new_token_ids, stopped) == ([41, 42], False)
+    assert list(request.output_token_ids) == [41, 42]
+    assert request.num_preemptions == 1
+    assert request.discard_latest_async_tokens is False
+
+
 def test_async_scheduler_patch_discards_stale_token_without_placeholders():
     from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 

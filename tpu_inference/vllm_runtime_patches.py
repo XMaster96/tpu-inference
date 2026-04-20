@@ -49,6 +49,7 @@ def _request_id_sample(requests, limit: int = 8) -> list[str]:
 
 def _request_state_summary(request) -> dict[str, object]:
     return {
+        "request_id": str(getattr(request, "request_id", None)),
         "status": str(getattr(request, "status", None)),
         "num_computed_tokens": getattr(request, "num_computed_tokens", None),
         "num_output_placeholders": getattr(
@@ -136,6 +137,69 @@ def _log_reload_event_context_once(
         _request_context_snapshot(scheduler, request_ids),
         extra or {},
     )
+
+
+def _should_log_request_event_context(
+    request,
+    event_name: str,
+) -> bool:
+    logged_events = getattr(
+        request,
+        "_tpu_reload_request_event_context_logged",
+        None,
+    )
+    if logged_events is None:
+        logged_events = set()
+        setattr(
+            request,
+            "_tpu_reload_request_event_context_logged",
+            logged_events,
+        )
+
+    key = (
+        event_name,
+        int(getattr(request, "_tpu_last_reload_requeue_generation", -1) or -1),
+    )
+    if key in logged_events:
+        return False
+
+    if len(logged_events) >= 32:
+        logged_events.clear()
+    logged_events.add(key)
+    return True
+
+
+def _log_request_event_context_once(
+    request,
+    *,
+    event_name: str,
+    message: str,
+    extra: dict[str, object] | None = None,
+) -> None:
+    if not _should_log_request_event_context(request, event_name):
+        return
+
+    logger.warning(
+        "%s | request=%s | extra=%s",
+        message,
+        _request_state_summary(request),
+        extra or {},
+    )
+
+
+def _summarize_requeue_actions(
+    requeue_actions: list[dict[str, object]],
+) -> dict[str, object]:
+    action_counts: dict[str, int] = {}
+    for action in requeue_actions:
+        action_name = str(action.get("action", "<unknown>"))
+        action_counts[action_name] = action_counts.get(action_name, 0) + 1
+
+    return {
+        "count": len(requeue_actions),
+        "action_counts": action_counts,
+        "sample": _truncate_values(requeue_actions, limit=4),
+    }
 
 
 def get_reload_generation(scheduler) -> int:
@@ -273,6 +337,7 @@ def requeue_missing_live_reload_requests(
     waiting = getattr(scheduler, "waiting", None)
     preempt_request = getattr(scheduler, "_preempt_request", None)
     timestamp = time.monotonic()
+    reload_generation = get_reload_generation(scheduler)
 
     try:
         from vllm.v1.request import RequestStatus
@@ -287,6 +352,49 @@ def requeue_missing_live_reload_requests(
             return any(queued_request is request for queued_request in waiting)
         except TypeError:
             return False
+
+    def _free_request_caches(request) -> None:
+        for manager_name in ("kv_cache_manager", "encoder_cache_manager"):
+            manager = getattr(scheduler, manager_name, None)
+            free = getattr(manager, "free", None)
+            if callable(free):
+                free(request)
+
+    def _reset_request_for_live_reload(
+        request,
+        *,
+        increment_preemptions: bool,
+        free_caches: bool,
+    ) -> None:
+        if free_caches:
+            _free_request_caches(request)
+        if RequestStatus is not None:
+            request.status = RequestStatus.PREEMPTED
+        if hasattr(request, "num_computed_tokens"):
+            request.num_computed_tokens = 0
+        if hasattr(request, "spec_token_ids"):
+            request.spec_token_ids.clear()
+        if increment_preemptions and hasattr(request, "num_preemptions"):
+            request.num_preemptions += 1
+        if hasattr(request, "num_output_placeholders"):
+            request.num_output_placeholders = 0
+        if hasattr(request, "discard_latest_async_tokens"):
+            request.discard_latest_async_tokens = True
+        setattr(
+            request,
+            "_tpu_last_reload_requeue_generation",
+            reload_generation,
+        )
+
+    def _already_requeued_for_generation(request) -> bool:
+        return int(
+            getattr(
+                request,
+                "_tpu_last_reload_requeue_generation",
+                -1,
+            )
+            or -1
+        ) == reload_generation
 
     requeue_actions: list[dict[str, object]] = []
 
@@ -313,35 +421,50 @@ def requeue_missing_live_reload_requests(
             RequestStatus is not None
             and request_status == RequestStatus.WAITING
         )
+        already_requeued_this_generation = _already_requeued_for_generation(request)
 
-        if callable(preempt_request) and removed_from_running:
+        if (
+            callable(preempt_request)
+            and removed_from_running
+            and not already_requeued_this_generation
+        ):
             preempt_request(request, timestamp)
+            if hasattr(request, "num_output_placeholders"):
+                request.num_output_placeholders = 0
+            if hasattr(request, "discard_latest_async_tokens"):
+                request.discard_latest_async_tokens = True
+            setattr(
+                request,
+                "_tpu_last_reload_requeue_generation",
+                reload_generation,
+            )
             action = "preempt_running"
         elif already_preempted or already_waiting:
+            _reset_request_for_live_reload(
+                request,
+                increment_preemptions=False,
+                free_caches=False,
+            )
             if not _is_in_waiting_queue(request) and hasattr(
                 waiting, "prepend_request"
             ):
                 waiting.prepend_request(request)
                 action = "restore_waiting_queue"
             else:
-                action = "preserve_waiting_queue"
+                action = "refresh_waiting_request"
         else:
-            if RequestStatus is not None:
-                request.status = RequestStatus.PREEMPTED
-            if hasattr(request, "num_computed_tokens"):
-                request.num_computed_tokens = 0
-            if hasattr(request, "spec_token_ids"):
-                request.spec_token_ids.clear()
-            if hasattr(request, "num_preemptions"):
-                request.num_preemptions += 1
+            _reset_request_for_live_reload(
+                request,
+                increment_preemptions=not already_requeued_this_generation,
+                free_caches=removed_from_running,
+            )
             if hasattr(waiting, "prepend_request"):
                 waiting.prepend_request(request)
-            action = "mark_preempted_and_prepend"
-
-        if hasattr(request, "num_output_placeholders"):
-            request.num_output_placeholders = 0
-        if hasattr(request, "discard_latest_async_tokens"):
-            request.discard_latest_async_tokens = True
+            action = (
+                "requeue_running_request"
+                if removed_from_running and already_requeued_this_generation
+                else "mark_preempted_and_prepend"
+            )
 
         requeue_actions.append(
             {
@@ -350,6 +473,7 @@ def requeue_missing_live_reload_requests(
                 "removed_from_running": removed_from_running,
                 "was_in_waiting": was_in_waiting,
                 "is_in_waiting": _is_in_waiting_queue(request),
+                "reload_generation": reload_generation,
                 **_request_state_summary(request),
             }
         )
@@ -378,6 +502,23 @@ def patch_async_scheduler_preempt_discard() -> None:
                 # async output arrives before the request has been rescheduled
                 # for at least this many fresh output tokens, it still belongs
                 # to the pre-reload execution and must be dropped.
+                _log_request_event_context_once(
+                    request,
+                    event_name="drop_stale_async_output",
+                    message=(
+                        "Dropping stale async output after live reload "
+                        "preemption before fresh placeholders were restored"
+                    ),
+                    extra={
+                        "reload_generation": getattr(
+                            request,
+                            "_tpu_last_reload_requeue_generation",
+                            None,
+                        ),
+                        "incoming_token_count": len(new_token_ids),
+                        "num_output_placeholders": num_output_placeholders,
+                    },
+                )
                 request.discard_latest_async_tokens = False
                 return [], False
 
@@ -593,7 +734,11 @@ def patch_scheduler_reload_stale_output() -> None:
                     "Live reload stale model output context"
                 ),
                 extra={
-                    "requeue_actions": _truncate_values(requeue_actions, limit=4),
+                    "requeue_actions": _summarize_requeue_actions(requeue_actions),
+                    "missing_req_count": len(missing_req_ids),
+                    "kept_req_ids": _request_id_sample(
+                        getattr(filtered_output, "num_scheduled_tokens", {}),
+                    ),
                     "model_runner_req_ids": _request_id_sample(
                         getattr(model_runner_output, "req_id_to_index", {}),
                     ),
