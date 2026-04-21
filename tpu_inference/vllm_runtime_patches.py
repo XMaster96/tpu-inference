@@ -125,9 +125,9 @@ def _log_reload_event_context_once(
     request_ids,
     message: str,
     extra: dict[str, object] | None = None,
-) -> None:
+) -> bool:
     if not _should_log_reload_event_context(scheduler, event_name, request_ids):
-        return
+        return False
 
     logger.warning(
         "%s | request_ids=%s | scheduler=%s | request_context=%s | extra=%s",
@@ -137,6 +137,7 @@ def _log_reload_event_context_once(
         _request_context_snapshot(scheduler, request_ids),
         extra or {},
     )
+    return True
 
 
 def _should_log_request_event_context(
@@ -700,7 +701,7 @@ def patch_scheduler_reload_stale_output() -> None:
                 getattr(scheduler_output, "num_scheduled_tokens", {}).keys()
             )
             if stale_req_ids:
-                _log_reload_event_context_once(
+                logged_context = _log_reload_event_context_once(
                     self,
                     event_name="stale_scheduler_output",
                     request_ids=stale_req_ids,
@@ -708,11 +709,12 @@ def patch_scheduler_reload_stale_output() -> None:
                         "Live reload stale scheduler output context"
                     ),
                 )
-                logger.warning(
-                    "Dropping stale scheduler output after live reload preemption "
-                    "for request ids: %s",
-                    stale_req_ids,
-                )
+                if logged_context:
+                    logger.warning(
+                        "Dropping stale scheduler output after live reload "
+                        "preemption for request ids: %s",
+                        stale_req_ids,
+                    )
             return {}
 
         filtered_output, missing_req_ids = (
@@ -726,7 +728,7 @@ def patch_scheduler_reload_stale_output() -> None:
                 self,
                 missing_req_ids,
             )
-            _log_reload_event_context_once(
+            logged_context = _log_reload_event_context_once(
                 self,
                 event_name="missing_request_indices",
                 request_ids=missing_req_ids,
@@ -744,11 +746,12 @@ def patch_scheduler_reload_stale_output() -> None:
                     ),
                 },
             )
-            logger.warning(
-                "Dropping stale model output entries missing request indices "
-                "after live reload preemption for request ids: %s",
-                missing_req_ids,
-            )
+            if logged_context:
+                logger.warning(
+                    "Dropping stale model output entries missing request "
+                    "indices after live reload preemption for request ids: %s",
+                    missing_req_ids,
+                )
         return original_update_from_output(
             self,
             filtered_output,

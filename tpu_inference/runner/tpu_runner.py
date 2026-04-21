@@ -702,6 +702,21 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def invalidate_live_reload_state(self) -> None:
         self.execute_model_state = None
         self._pre_async_results = None
+        input_batch = getattr(self, "input_batch", None)
+        if input_batch is None:
+            return
+
+        req_ids = list(getattr(input_batch, "req_id_to_index", {}).keys())
+        removed_req_indices = []
+        for req_id in req_ids:
+            req_index = input_batch.remove_request(req_id)
+            if isinstance(req_index, int):
+                removed_req_indices.append(req_index)
+
+        if removed_req_indices:
+            input_batch.condense(sorted(removed_req_indices, reverse=True))
+        if hasattr(input_batch, "request_distribution"):
+            input_batch.request_distribution = [0, 0, 0]
 
     def _update_placeholder(self,
                             discard_sampled_tokens_req_indices,

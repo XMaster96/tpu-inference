@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from vllm.sampling_params import SamplingParams
 
+from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
+from tpu_inference.runner.persistent_batch_manager import \
+    PersistentBatchManager
 from tpu_inference.runner.tpu_runner import AsyncPreResults, TPUModelRunner
 
 
@@ -1138,6 +1142,76 @@ class TestTPUJaxRunnerDPInputsLightweight:
 
         assert self.runner.execute_model_state is None
         assert self.runner._pre_async_results is None
+
+
+@pytest.mark.online_rl_server_related
+def test_invalidate_live_reload_state_clears_worker_batch_without_dropping_request(
+):
+    runner = object.__new__(TPUModelRunner)
+    input_batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=32,
+        max_num_batched_tokens=64,
+        pin_memory=False,
+        vocab_size=128,
+        block_sizes=[16],
+    )
+    request = CachedRequestState(
+        req_id="req-live",
+        prompt_token_ids=[1, 2, 3],
+        mm_features=[],
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        block_ids=([1], ),
+        num_computed_tokens=3,
+        lora_request=None,
+        output_token_ids=[11],
+    )
+    input_batch.add_request(request)
+    runner.input_batch = input_batch
+    runner.requests = {"req-live": request}
+    runner.execute_model_state = object()
+    runner._pre_async_results = object()
+
+    TPUModelRunner.invalidate_live_reload_state(runner)
+
+    assert runner.execute_model_state is None
+    assert runner._pre_async_results is None
+    assert runner.requests == {"req-live": request}
+    assert input_batch.num_reqs == 0
+    assert input_batch.req_ids == []
+    assert input_batch.req_id_to_index == {}
+    assert input_batch.req_output_token_ids == []
+
+    manager = PersistentBatchManager(
+        requests=runner.requests,
+        input_batch=input_batch,
+        encoder_cache={},
+        uses_mrope=False,
+        model_config=MagicMock(),
+        is_last_rank=True,
+    )
+    scheduler_output = MagicMock()
+    scheduler_output.finished_req_ids = []
+    scheduler_output.free_encoder_mm_hashes = []
+    scheduler_output.num_scheduled_tokens = {"req-live": 1}
+    scheduler_output.scheduled_new_reqs = []
+    scheduler_output.scheduled_spec_decode_tokens = {}
+    scheduler_output.scheduled_cached_reqs = MagicMock(
+        req_ids=["req-live"],
+        resumed_req_ids={"req-live"},
+        num_computed_tokens=[0],
+        new_block_ids=[[[2]]],
+        new_token_ids=[[]],
+        num_output_tokens=[0],
+    )
+
+    batch_changed = manager.update_states(scheduler_output, None)
+
+    assert batch_changed is True
+    assert input_batch.req_ids == ["req-live"]
+    assert input_batch.req_id_to_index == {"req-live": 0}
+    assert request.block_ids == [[2]]
 
 
 if __name__ == "__main__":
