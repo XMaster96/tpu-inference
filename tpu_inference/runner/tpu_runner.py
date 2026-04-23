@@ -130,6 +130,10 @@ def _summarize_scheduler_output_for_empty_cycle(
                 getattr(scheduler_output, "scheduled_spec_decode_tokens", {}) or {}
             ).keys()
         ),
+        "tpu_scheduler_state_snapshot": getattr(
+            scheduler_output, "_tpu_scheduler_state_snapshot", None),
+        "tpu_last_live_reload_recovery": getattr(
+            scheduler_output, "_tpu_last_live_reload_recovery", None),
     }
 
 
@@ -768,11 +772,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             # NOTE(pooyam): There is no guarantee that scheduler is not sending empty output: https://github.com/vllm-project/vllm/blob/7cfea0df390c154c1026f77d3682e2733ca4aca8/vllm/v1/engine/core.py#L275
             # Why they are not preventing that is not clear to me.
             if len(scheduler_output.finished_req_ids) == 0:
-                logger.warning(
-                    "Should not schedule a request that does nothing! details=%s",
-                    _summarize_scheduler_output_for_empty_cycle(
-                        scheduler_output),
-                )
+                details = _summarize_scheduler_output_for_empty_cycle(
+                    scheduler_output)
+                if getattr(
+                    scheduler_output,
+                    "_tpu_last_live_reload_recovery",
+                    None,
+                ) is not None:
+                    logger.error(
+                        "TPU runner received empty scheduler output after "
+                        "live reload recovery; this indicates no model-runner "
+                        "forward progress for live requests | details=%s",
+                        details,
+                    )
+                else:
+                    logger.warning(
+                        "Should not schedule a request that does nothing! "
+                        "details=%s",
+                        details,
+                    )
                 # raise Exception(
                 #     "Should not schedule a request that does nothing!")
             return EMPTY_MODEL_RUNNER_OUTPUT

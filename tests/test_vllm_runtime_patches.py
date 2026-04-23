@@ -160,6 +160,107 @@ def test_scheduler_missing_request_indices_warning_is_rate_limited(
     assert waiting.prepended == [request]
 
 
+def test_scheduler_logs_fully_filtered_live_reload_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    apply_vllm_runtime_patches()
+
+    class _WaitingQueue:
+
+        def __init__(self):
+            self.prepended: list[object] = []
+
+        def prepend_request(self, request):
+            if request not in self.prepended:
+                self.prepended.append(request)
+
+        def __iter__(self):
+            return iter(self.prepended)
+
+    def _scheduler_output() -> SchedulerOutput:
+        scheduler_output = SchedulerOutput.make_empty()
+        scheduler_output.num_scheduled_tokens = {
+            "req-0": 1,
+            "req-1": 1,
+        }
+        scheduler_output.total_num_scheduled_tokens = 2
+        return scheduler_output
+
+    waiting = _WaitingQueue()
+    requests = {
+        req_id: SimpleNamespace(
+            request_id=req_id,
+            status=RequestStatus.RUNNING,
+            num_computed_tokens=16,
+            num_output_placeholders=1,
+            spec_token_ids=[],
+            num_preemptions=0,
+            discard_latest_async_tokens=False,
+        )
+        for req_id in ("req-0", "req-1")
+    }
+
+    def _preempt_request(request, _timestamp):
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.num_output_placeholders = 0
+        request.num_preemptions += 1
+        request.discard_latest_async_tokens = True
+        waiting.prepend_request(request)
+
+    fake_scheduler = SimpleNamespace(
+        perf_metrics=None,
+        connector=None,
+        kv_cache_manager=SimpleNamespace(take_events=lambda: None),
+        kv_event_publisher=SimpleNamespace(publish=lambda batch: None),
+        finished_req_ids_dict={},
+        make_stats=lambda *args, **kwargs: None,
+        requests=requests,
+        running=list(requests.values()),
+        waiting=waiting,
+        prev_step_scheduled_req_ids=set(requests),
+        _preempt_request=_preempt_request,
+        _tpu_reload_generation=34,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=None,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+    )
+    error_messages: list[str] = []
+
+    def _capture_error(message, *args, **kwargs):
+        del kwargs
+        error_messages.append(message % args if args else message)
+
+    monkeypatch.setattr(runtime_patches.logger, "error", _capture_error)
+
+    Scheduler.update_from_output(
+        fake_scheduler,
+        _scheduler_output(),
+        model_runner_output,
+    )
+
+    assert any(
+        "filtered every scheduled model output" in message
+        for message in error_messages
+    )
+    recovery = fake_scheduler._tpu_last_live_reload_recovery
+    assert recovery["reload_generation"] == 34
+    assert recovery["model_runner_output"]["req_id_to_index_count"] == 0
+    assert recovery["scheduler_output_before_filter"][
+        "total_num_scheduled_tokens"] == 2
+    assert recovery["scheduler_output_after_filter"][
+        "total_num_scheduled_tokens"] == 0
+    assert recovery["scheduler"]["request_count"] == 2
+    assert all(request.discard_latest_async_tokens for request in requests.values())
+
+
 def test_stale_model_output_wave_requeues_once_and_request_resumes(
     monkeypatch: pytest.MonkeyPatch,
 ):

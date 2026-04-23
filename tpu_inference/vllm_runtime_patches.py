@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import faulthandler
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -11,6 +12,9 @@ from tpu_inference.logger import init_logger
 logger = init_logger(__name__)
 _T = TypeVar("_T")
 _DEBUG_RELOAD_RACE = os.environ.get("TPU_DEBUG_RELOAD_RACE") == "1"
+_LIVE_RELOAD_NO_PROGRESS_LOG_INTERVAL_SECONDS = float(
+    os.environ.get("TPU_LIVE_RELOAD_NO_PROGRESS_LOG_INTERVAL_SECONDS", "30.0")
+)
 
 
 def _safe_len(value) -> int | None:
@@ -47,6 +51,49 @@ def _request_id_sample(requests, limit: int = 8) -> list[str]:
     return [str(value) for value in _truncate_values(request_ids, limit=limit)]
 
 
+def _parse_proc_kb_fields(path: str, fields: set[str]) -> dict[str, object]:
+    values: dict[str, object] = {}
+    try:
+        with open(path, encoding="utf-8") as proc_file:
+            for line in proc_file:
+                key, _, rest = line.partition(":")
+                if key not in fields:
+                    continue
+                raw_value = rest.strip().split()[0]
+                values[f"{key}_gib"] = round(int(raw_value) / (1024**2), 3)
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+    return values
+
+
+def _host_memory_snapshot() -> dict[str, object]:
+    return _parse_proc_kb_fields(
+        "/proc/meminfo",
+        {
+            "MemTotal",
+            "MemFree",
+            "MemAvailable",
+            "AnonPages",
+            "PageTables",
+            "CommitLimit",
+            "Committed_AS",
+        },
+    )
+
+
+def _process_memory_snapshot() -> dict[str, object]:
+    return _parse_proc_kb_fields(
+        "/proc/self/status",
+        {
+            "VmPeak",
+            "VmSize",
+            "VmRSS",
+            "VmHWM",
+            "VmData",
+        },
+    )
+
+
 def _request_state_summary(request) -> dict[str, object]:
     return {
         "request_id": str(getattr(request, "request_id", None)),
@@ -72,6 +119,95 @@ def _scheduler_state_snapshot(scheduler) -> dict[str, object]:
             getattr(scheduler, "prev_step_scheduled_req_ids", None)
         ),
     }
+
+
+def _scheduler_output_snapshot(scheduler_output) -> dict[str, object]:
+    cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
+    return {
+        "total_num_scheduled_tokens": getattr(
+            scheduler_output, "total_num_scheduled_tokens", None),
+        "num_scheduled_tokens": dict(
+            getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
+        ),
+        "scheduled_new_req_ids": [
+            str(getattr(req_data, "req_id", "<unknown>"))
+            for req_data in getattr(
+                scheduler_output, "scheduled_new_reqs", ()
+            ) or ()
+        ],
+        "scheduled_cached_req_ids": _request_id_sample(
+            getattr(cached_reqs, "req_ids", ())),
+        "finished_req_ids": _request_id_sample(
+            getattr(scheduler_output, "finished_req_ids", ())),
+        "preempted_req_ids": _request_id_sample(
+            getattr(scheduler_output, "preempted_req_ids", ())),
+    }
+
+
+def _model_runner_output_snapshot(model_runner_output) -> dict[str, object]:
+    req_id_to_index = getattr(model_runner_output, "req_id_to_index", {}) or {}
+    sampled_token_ids = getattr(model_runner_output, "sampled_token_ids", None)
+    return {
+        "req_id_to_index_count": _safe_len(req_id_to_index),
+        "req_id_to_index_ids": _request_id_sample(req_id_to_index),
+        "sampled_token_rows": _safe_len(sampled_token_ids),
+        "has_sampled_token_ids": sampled_token_ids is not None,
+    }
+
+
+def _public_recovery_snapshot(recovery: dict[str, object] | None):
+    if not recovery:
+        return None
+    public = dict(recovery)
+    monotonic_time = public.pop("monotonic_time", None)
+    if isinstance(monotonic_time, (int, float)):
+        public["age_seconds"] = round(time.monotonic() - monotonic_time, 3)
+    return public
+
+
+def _last_live_reload_recovery_snapshot(scheduler):
+    return _public_recovery_snapshot(
+        getattr(scheduler, "_tpu_last_live_reload_recovery", None))
+
+
+def _record_live_reload_recovery(
+    scheduler,
+    *,
+    missing_req_ids,
+    scheduler_output,
+    filtered_output,
+    model_runner_output,
+    requeue_actions: list[dict[str, object]],
+) -> dict[str, object]:
+    recovery = {
+        "monotonic_time": time.monotonic(),
+        "reload_generation": get_reload_generation(scheduler),
+        "missing_req_ids": _request_id_sample(missing_req_ids),
+        "missing_req_count": len(missing_req_ids),
+        "scheduler": _scheduler_state_snapshot(scheduler),
+        "scheduler_output_before_filter": _scheduler_output_snapshot(
+            scheduler_output),
+        "scheduler_output_after_filter": _scheduler_output_snapshot(
+            filtered_output),
+        "model_runner_output": _model_runner_output_snapshot(
+            model_runner_output),
+        "requeue_actions": _summarize_requeue_actions(requeue_actions),
+        "host_memory": _host_memory_snapshot(),
+        "process_memory": _process_memory_snapshot(),
+    }
+    setattr(scheduler, "_tpu_last_live_reload_recovery", recovery)
+    return recovery
+
+
+def _annotate_scheduler_output_debug_context(scheduler, scheduler_output) -> None:
+    setattr(
+        scheduler_output,
+        "_tpu_scheduler_state_snapshot",
+        _scheduler_state_snapshot(scheduler),
+    )
+    recovery = _last_live_reload_recovery_snapshot(scheduler)
+    if recovery is not None:
+        setattr(scheduler_output, "_tpu_last_live_reload_recovery", recovery)
 
 
 def _request_context_snapshot(
@@ -213,6 +349,7 @@ def mark_scheduler_output_reload_generation(scheduler, scheduler_output) -> None
         "_tpu_reload_generation",
         get_reload_generation(scheduler),
     )
+    _annotate_scheduler_output_debug_context(scheduler, scheduler_output)
 
 
 def is_stale_scheduler_output(scheduler, scheduler_output) -> bool:
@@ -616,14 +753,23 @@ def patch_scheduler_reload_stale_output() -> None:
 
     def _patched_schedule(self, *args, **kwargs):
         scheduler_output = original_schedule(self, *args, **kwargs)
+        mark_scheduler_output_reload_generation(self, scheduler_output)
+        live_requests = getattr(self, "requests", None)
+        if not live_requests:
+            setattr(self, "_tpu_last_live_reload_recovery", None)
         if (
-            _DEBUG_RELOAD_RACE
-            and scheduler_output.total_num_scheduled_tokens == 0
-            and getattr(self, "requests", None)
+            scheduler_output.total_num_scheduled_tokens == 0
+            and live_requests
+            and not getattr(scheduler_output, "finished_req_ids", None)
         ):
             now = time.monotonic()
             last_log = float(getattr(self, "_tpu_debug_last_empty_schedule_log", 0.0))
-            if now - last_log >= 1.0:
+            recovery = _last_live_reload_recovery_snapshot(self)
+            should_log = _DEBUG_RELOAD_RACE or recovery is not None
+            if (
+                should_log
+                and now - last_log >= _LIVE_RELOAD_NO_PROGRESS_LOG_INTERVAL_SECONDS
+            ):
                 request_states = {
                     req_id: str(getattr(req, "status", "<unknown>"))
                     for req_id, req in self.requests.items()
@@ -636,15 +782,22 @@ def patch_scheduler_reload_stale_output() -> None:
                     str(getattr(req, "request_id", "<unknown>"))
                     for req in list(getattr(self, "running", []))
                 ]
-                logger.warning(
-                    "Empty scheduler output with live requests | waiting=%s | "
-                    "running=%s | request_states=%s",
+                log = logger.error if recovery is not None else logger.warning
+                log(
+                    "Scheduler produced empty output with live requests after "
+                    "live reload recovery; EngineCore may be wedged if this "
+                    "repeats | waiting=%s | running=%s | request_states=%s | "
+                    "scheduler=%s | last_live_reload_recovery=%s | "
+                    "host_memory=%s | process_memory=%s",
                     waiting_ids,
                     running_ids,
                     request_states,
+                    _scheduler_state_snapshot(self),
+                    recovery,
+                    _host_memory_snapshot(),
+                    _process_memory_snapshot(),
                 )
                 self._tpu_debug_last_empty_schedule_log = now
-        mark_scheduler_output_reload_generation(self, scheduler_output)
         return scheduler_output
 
     def _patched_reset_prefix_cache(self, *args, **kwargs):
@@ -728,6 +881,14 @@ def patch_scheduler_reload_stale_output() -> None:
                 self,
                 missing_req_ids,
             )
+            recovery = _record_live_reload_recovery(
+                self,
+                missing_req_ids=missing_req_ids,
+                scheduler_output=scheduler_output,
+                filtered_output=filtered_output,
+                model_runner_output=model_runner_output,
+                requeue_actions=requeue_actions,
+            )
             logged_context = _log_reload_event_context_once(
                 self,
                 event_name="missing_request_indices",
@@ -752,6 +913,17 @@ def patch_scheduler_reload_stale_output() -> None:
                     "indices after live reload preemption for request ids: %s",
                     missing_req_ids,
                 )
+                if (
+                    not getattr(filtered_output, "num_scheduled_tokens", None)
+                    and getattr(self, "requests", None)
+                ):
+                    logger.error(
+                        "Live reload recovery filtered every scheduled model "
+                        "output while requests remain live; next logs should "
+                        "show whether the scheduler rescheduled them or wedged "
+                        "| recovery=%s",
+                        _public_recovery_snapshot(recovery),
+                    )
         return original_update_from_output(
             self,
             filtered_output,
@@ -796,6 +968,8 @@ def patch_scheduler_reload_stale_output() -> None:
                 sorted(getattr(self, "requests", {}).keys()),
             )
         result = original_finish_requests(self, request_ids, finished_status)
+        if not getattr(self, "requests", None):
+            setattr(self, "_tpu_last_live_reload_recovery", None)
         if _DEBUG_RELOAD_RACE:
             logger.warning(
                 "Scheduler.finish_requests done | waiting=%s | running=%s | "
@@ -815,6 +989,15 @@ def patch_scheduler_reload_stale_output() -> None:
 
 
 def apply_vllm_runtime_patches() -> None:
+    if not getattr(apply_vllm_runtime_patches, "_faulthandler_enabled", False):
+        try:
+            faulthandler.enable(all_threads=True)
+            apply_vllm_runtime_patches._faulthandler_enabled = True
+        except Exception as exc:
+            logger.warning(
+                "Could not enable faulthandler for EngineCore diagnostics: %s",
+                exc,
+            )
     patch_async_llm_request_admission_gate()
     patch_async_scheduler_preempt_discard()
     patch_scheduler_reload_stale_output()
