@@ -62,6 +62,20 @@ class JaxModule(nnx.Module):
             elif isinstance(value, list) or isinstance(value, nnx.List):
                 yield name, JaxModuleList(value)
 
+    def named_modules(
+            self,
+            prefix: str = "",
+            recurse: bool = True) -> Iterator[tuple[str, "JaxModule | JaxModuleList"]]:
+        """Yields this module and its child modules, matching torch.nn.Module."""
+        yield prefix, self
+
+        if not recurse:
+            return
+
+        for name, child in self.named_children():
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            yield from child.named_modules(prefix=child_prefix, recurse=True)
+
 
 class JaxModuleList(nnx.List):
     """A list container for JaxModule objects."""
@@ -101,3 +115,17 @@ class JaxModuleList(nnx.List):
                 yield str(idx), item
             elif isinstance(item, list):
                 yield str(idx), JaxModuleList(item)
+
+    def named_modules(
+            self,
+            prefix: str = "",
+            recurse: bool = True) -> Iterator[tuple[str, "JaxModule | JaxModuleList"]]:
+        """Yields this module list and its child modules, matching torch.nn.Module."""
+        yield prefix, self
+
+        if not recurse:
+            return
+
+        for name, child in self.named_children():
+            child_prefix = f"{prefix}.{name}" if prefix else name
+            yield from child.named_modules(prefix=child_prefix, recurse=True)

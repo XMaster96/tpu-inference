@@ -778,7 +778,7 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
         is_first_rank: bool = True,
         is_last_rank: bool = True,
         *args,
-    ) -> Tuple[List[jax.Array], jax.Array | Any, List[jax.Array]]:
+    ) -> Tuple[List[jax.Array], jax.Array | Any, List[jax.Array], None]:
 
         multimodal_embeddings = getattr(attention_metadata,
                                         "multimodal_embeddings", None)
@@ -806,7 +806,7 @@ class Gemma4ForConditionalGeneration(JaxModule, LoadableWithIterator):
                 JaxIntermediateTensors
             x = JaxIntermediateTensors(tensors={"hidden_states": x})
 
-        return kv_caches, x, []
+        return kv_caches, x, [], None
 
     def compute_logits(self, hidden_states: jax.Array) -> jax.Array:
         if hasattr(self, 'lm_head'):

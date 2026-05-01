@@ -73,11 +73,8 @@ class StructuredDecodingManager:
         self.runner.grammar_bitmask_cpu.fill(0)
         self.runner.require_structured_out_cpu.fill(0)
 
-        sorted_struct_requests = sorted(
-            grammar_output.structured_output_request_ids)
-
         cumulative_mask_idx = 0
-        for req_id in sorted_struct_requests:
+        for req_id in grammar_output.structured_output_request_ids:
             if req_id not in self.runner.input_batch.req_id_to_index:
                 continue
             batch_index = self.runner.input_batch.req_id_to_index[req_id]
