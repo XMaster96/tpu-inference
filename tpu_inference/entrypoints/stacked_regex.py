@@ -16,7 +16,12 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 
+from tpu_inference.runner.logprob_options import (
+    RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG,
+)
+
 _STRUCTURED_OUTPUT_PRIVATE_FIELDS = {"_backend", "_backend_was_auto"}
+_TPU_COMPLETION_PRIVATE_FIELDS = {"return_native_token_logprobs"}
 _STACKED_REGEX_EXTRA_ARG = "tpu_staged_regex"
 
 
@@ -111,6 +116,14 @@ class TPUCompletionRequest(CompletionRequest):
         default=None,
         description="Additional kwargs for structured outputs",
     )
+    return_native_token_logprobs: bool = Field(
+        default=False,
+        description=(
+            "When logprobs are requested, return the selected token logprob "
+            "from raw model logits before TPU structured decoding masks are "
+            "applied. Sampling still uses the processed logits."
+        ),
+    )
 
     def to_sampling_params(
         self,
@@ -120,11 +133,12 @@ class TPUCompletionRequest(CompletionRequest):
     ) -> SamplingParams:
         regexes = self.stacked_regexes()
         if regexes is None:
-            return super().to_sampling_params(
+            sampling_params = super().to_sampling_params(
                 max_tokens,
                 logits_processor_pattern,
                 default_sampling_params,
             )
+            return self._apply_tpu_sampling_extensions(sampling_params)
 
         payload = _completion_request_payload(self)
         structured_outputs = cast(dict[str, Any], payload["structured_outputs"])
@@ -139,6 +153,22 @@ class TPUCompletionRequest(CompletionRequest):
         extra_args = dict(sampling_params.extra_args or {})
         extra_args[_STACKED_REGEX_EXTRA_ARG] = regexes
         sampling_params.extra_args = extra_args
+        return self._apply_tpu_sampling_extensions(sampling_params)
+
+    def _apply_tpu_sampling_extensions(
+        self,
+        sampling_params: SamplingParams,
+    ) -> SamplingParams:
+        if self.return_native_token_logprobs:
+            if self.logprobs is None or self.logprobs <= 0:
+                raise VLLMValidationError(
+                    "return_native_token_logprobs requires logprobs > 0.",
+                    parameter="return_native_token_logprobs",
+                    value=self.logprobs,
+                )
+            extra_args = dict(sampling_params.extra_args or {})
+            extra_args[RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG] = True
+            sampling_params.extra_args = extra_args
         return sampling_params
 
     def stacked_regexes(self) -> list[str] | None:
@@ -296,7 +326,7 @@ def install_staged_guidance_patch() -> None:
 
 
 def _completion_request_payload(request: TPUCompletionRequest) -> dict[str, Any]:
-    exclude: dict[str, Any] = {}
+    exclude: dict[str, Any] = {field_name: True for field_name in _TPU_COMPLETION_PRIVATE_FIELDS}
     if request.structured_outputs is not None:
         exclude["structured_outputs"] = _STRUCTURED_OUTPUT_PRIVATE_FIELDS
     return request.model_dump(exclude=exclude)

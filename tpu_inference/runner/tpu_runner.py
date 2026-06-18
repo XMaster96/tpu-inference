@@ -161,7 +161,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._next_tokens = next_tokens
         self._num_reqs = num_reqs
         self._discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
-        self.logits_indices_selector: list[int] = logits_indices_selector
+        self.logits_indices_selector: Optional[List[int]] = logits_indices_selector
 
     def get_output(self) -> ModelRunnerOutput:
         next_tokens_cpu = np.asarray(jax.device_get(self._next_tokens))
@@ -631,6 +631,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                              self.execute_model_state.padded_num_reqs)
         self.execute_model_state = None
 
+        raw_logits = logits
         if grammar_output is not None:
             (
                 require_struct_decoding, grammar_bitmask_padded, arange
@@ -643,9 +644,17 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 arange,
             )
         return self._sample_from_logits(
-            scheduler_output, attn_metadata, input_ids, hidden_states, logits,
-            aux_hidden_states, spec_decode_metadata, kv_connector_output,
-            logits_indices_selector, padded_num_reqs)
+            scheduler_output,
+            attn_metadata,
+            input_ids,
+            hidden_states,
+            logits,
+            aux_hidden_states,
+            spec_decode_metadata,
+            kv_connector_output,
+            logits_indices_selector,
+            padded_num_reqs,
+            raw_logits=raw_logits)
 
     def _modify_prev_results(self):
         # If copy to host has not been done, we just wait.
@@ -904,6 +913,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         kv_connector_output: Optional[KVConnectorOutput],
         logits_indices_selector: Optional[List[int]] = None,
         padded_num_reqs: Optional[int] = None,
+        raw_logits: Optional[jax.Array] = None,
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
         if padded_num_reqs is None:
             padded_num_reqs = runner_utils.get_padded_num_reqs_with_upper_limit(
@@ -958,8 +968,22 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             )
 
         if tpu_sampling_metadata.logprobs:
-            logprobs = self._compute_and_gather_logprobs(
-                logits, next_tokens, self.model_config.max_logprobs)
+            native_token_logprobs_mask = self._native_token_logprobs_mask(
+                padded_num_reqs)
+            if (
+                raw_logits is not None
+                and native_token_logprobs_mask is not None
+            ):
+                logprobs = self._compute_and_gather_logprobs_with_native_selected(
+                    logits,
+                    raw_logits,
+                    next_tokens,
+                    native_token_logprobs_mask,
+                    self.model_config.max_logprobs,
+                )
+            else:
+                logprobs = self._compute_and_gather_logprobs(
+                    logits, next_tokens, self.model_config.max_logprobs)
         else:
             logprobs = None
 
@@ -1110,6 +1134,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         )
         return model_runner_output
 
+    def _native_token_logprobs_mask(
+        self,
+        padded_num_reqs: int,
+    ) -> Optional[jax.Array]:
+        native_req_ids = self.input_batch.native_token_logprobs_req_ids
+        if not native_req_ids:
+            return None
+
+        num_reqs = self.input_batch.num_reqs
+        mask_cpu = np.zeros((padded_num_reqs, ), dtype=np.bool_)
+        for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id in native_req_ids:
+                mask_cpu[req_idx] = True
+        if not np.any(mask_cpu[:num_reqs]):
+            return None
+        return device_array(self.mesh, mask_cpu)
+
     @functools.partial(jax.jit, static_argnums=(0, ))
     def _select_from_array_fn(self, array, indices_to_select):
 
@@ -1131,6 +1172,53 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
     def _compute_and_gather_logprobs(logits, next_tokens, max_logprobs):
         logprobs = compute_logprobs(logits)
         return gather_logprobs(logprobs, next_tokens, max_logprobs)
+
+    @staticmethod
+    @functools.partial(jax.jit, static_argnames=("max_logprobs", ))
+    def _compute_and_gather_logprobs_with_native_selected(
+        logits,
+        raw_logits,
+        next_tokens,
+        native_token_logprobs_mask,
+        max_logprobs,
+    ):
+        processed_logprobs = compute_logprobs(logits)
+        gathered = gather_logprobs(
+            processed_logprobs,
+            next_tokens,
+            max_logprobs,
+        )
+
+        raw_logprobs = compute_logprobs(raw_logits)
+        selected_token_ids = jnp.expand_dims(next_tokens, axis=-1)
+        raw_selected_logprobs = jnp.take_along_axis(
+            raw_logprobs,
+            selected_token_ids,
+            axis=-1,
+        )
+        raw_selected_ranks = jnp.sum(
+            raw_logprobs >= raw_selected_logprobs,
+            axis=-1,
+        )
+
+        mask = jnp.expand_dims(native_token_logprobs_mask, axis=-1)
+        selected_token_mask = gathered.logprob_token_ids == selected_token_ids
+        logprobs = jnp.where(
+            mask & selected_token_mask,
+            raw_selected_logprobs,
+            gathered.logprobs,
+        )
+        selected_token_ranks = jnp.where(
+            native_token_logprobs_mask,
+            raw_selected_ranks,
+            gathered.selected_token_ranks,
+        )
+
+        return type(gathered)(
+            gathered.logprob_token_ids,
+            logprobs,
+            selected_token_ranks,
+        )
 
     def _prepare_dp_input_metadata(self,
                                    scheduler_output: "VllmSchedulerOutput"):

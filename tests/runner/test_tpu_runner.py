@@ -23,6 +23,45 @@ from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
 from tpu_inference.runner.tpu_runner import TPUModelRunner
 
 
+def test_native_selected_logprobs_replace_only_flagged_rows():
+    processed_logits = jnp.asarray(
+        [
+            [0.0, 8.0, -2.0],
+            [1.0, 2.0, 3.0],
+        ],
+        dtype=jnp.float32,
+    )
+    raw_logits = jnp.asarray(
+        [
+            [5.0, 1.0, -1.0],
+            [4.0, 2.0, 1.0],
+        ],
+        dtype=jnp.float32,
+    )
+    next_tokens = jnp.asarray([1, 0], dtype=jnp.int32)
+    native_mask = jnp.asarray([True, False])
+
+    gathered = TPUModelRunner._compute_and_gather_logprobs_with_native_selected(
+        processed_logits,
+        raw_logits,
+        next_tokens,
+        native_mask,
+        2,
+    )
+
+    gathered_logprobs = np.asarray(gathered.logprobs)
+    gathered_ranks = np.asarray(gathered.selected_token_ranks)
+    raw_logprobs = np.asarray(jax.nn.log_softmax(raw_logits, axis=-1))
+    processed_logprobs = np.asarray(
+        jax.nn.log_softmax(processed_logits, axis=-1))
+
+    assert gathered_logprobs[0, 0] == np.asarray(raw_logprobs[0, 1])
+    assert gathered_logprobs[0, 1] == np.asarray(raw_logprobs[0, 1])
+    assert gathered_logprobs[1, 0] == np.asarray(processed_logprobs[1, 0])
+    assert gathered_ranks[0] == 2
+    assert gathered_ranks[1] == 3
+
+
 class TestTPUJaxRunner:
 
     def setup_method(self):

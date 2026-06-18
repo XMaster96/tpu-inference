@@ -37,6 +37,9 @@ from tpu_inference.entrypoints.stacked_regex import (
     normalize_completion_request,
     validate_stacked_regexes,
 )
+from tpu_inference.runner.logprob_options import (
+    RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG,
+)
 
 pytestmark = pytest.mark.online_rl_server_related
 
@@ -227,6 +230,53 @@ class TestStackedRegexNormalization(unittest.TestCase):
         self.assertIsNotNone(sampling_params.structured_outputs)
         self.assertEqual(sampling_params.structured_outputs.regex, r"foo+")
         self.assertEqual(extract_stacked_regexes(sampling_params), [r"foo+", r"bar?"])
+
+    def test_to_sampling_params_stashes_native_token_logprobs_flag(self):
+        request = TPUCompletionRequest.model_validate(
+            {
+                "model": "model",
+                "prompt": "prompt",
+                "logprobs": 1,
+                "return_native_token_logprobs": True,
+            }
+        )
+
+        sampling_params = request.to_sampling_params(16, None, None)
+
+        self.assertIsNotNone(sampling_params.extra_args)
+        self.assertTrue(
+            sampling_params.extra_args[RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG])
+
+    def test_native_token_logprobs_requires_positive_logprobs(self):
+        request = TPUCompletionRequest.model_validate(
+            {
+                "model": "model",
+                "prompt": "prompt",
+                "return_native_token_logprobs": True,
+            }
+        )
+
+        with self.assertRaisesRegex(VLLMValidationError,
+                                    "requires logprobs > 0"):
+            request.to_sampling_params(16, None, None)
+
+    def test_stacked_regex_preserves_native_token_logprobs_flag(self):
+        request = TPUCompletionRequest.model_validate(
+            {
+                "model": "model",
+                "prompt": "prompt",
+                "logprobs": 1,
+                "return_native_token_logprobs": True,
+                "structured_outputs": {"regex": [r"foo+", r"bar?"]},
+            }
+        )
+
+        sampling_params = request.to_sampling_params(16, None, None)
+
+        self.assertEqual(extract_stacked_regexes(sampling_params), [r"foo+", r"bar?"])
+        self.assertIsNotNone(sampling_params.extra_args)
+        self.assertTrue(
+            sampling_params.extra_args[RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG])
 
     def test_normalize_regex_list_requires_guidance_backend(self):
         request = TPUCompletionRequest.model_validate(

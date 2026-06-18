@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -607,6 +608,65 @@ def _completion_request(
     return payload
 
 
+def _forced_token_logprob_request(
+    ctx: _ServerContext,
+    *,
+    forced_text: str,
+    return_native_token_logprobs: bool,
+) -> dict[str, Any]:
+    regex = f"^{re.escape(forced_text)}$"
+    payload = {
+        "model": ctx.model_name,
+        "prompt": (
+            "Return the single most likely next word in plain English. "
+            "Do not use symbols."
+        ),
+        "stream": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 1,
+        "skip_special_tokens": False,
+        "logprobs": 1,
+        "return_token_ids": True,
+        "structured_outputs": {
+            "regex": regex
+        },
+    }
+    if return_native_token_logprobs:
+        payload["return_native_token_logprobs"] = True
+
+    response = requests.post(
+        f"{ctx.base_url}/v1/completions",
+        json=payload,
+        timeout=ctx.config.completion_timeout_seconds,
+    )
+    assert response.status_code == 200, (
+        f"/v1/completions failed with {response.status_code}: "
+        f"{response.text[:4000]}")
+    completion_payload = response.json()
+    choices = completion_payload.get("choices")
+    assert isinstance(choices,
+                      list) and choices, "Completion returned no choices."
+    choice = choices[0]
+    assert isinstance(choice, dict), "Completion choice must be a dictionary."
+    assert choice.get("text") == forced_text
+    assert choice.get("token_ids"), "Completion did not include token_ids."
+
+    logprobs = choice.get("logprobs")
+    assert isinstance(logprobs, dict), "Completion logprobs must be present."
+    token_logprobs = logprobs.get("token_logprobs")
+    tokens = logprobs.get("tokens")
+    assert isinstance(token_logprobs, list)
+    assert isinstance(tokens, list)
+    assert len(token_logprobs) == 1
+    assert len(tokens) == 1
+    token_logprob = token_logprobs[0]
+    assert isinstance(token_logprob, int | float)
+    assert math.isfinite(float(token_logprob))
+    completion_payload["_test_selected_token_logprob"] = float(token_logprob)
+    return completion_payload
+
+
 def _online_rl_server_context_for_config(
         cfg: _E2EConfig) -> Generator[_ServerContext, None, None]:
     assert cfg.parallel_generations >= 1, (
@@ -719,6 +779,34 @@ def _online_rl_server_context_for_config(
 @pytest.fixture(scope="module")
 def online_rl_server_context() -> Generator[_ServerContext, None, None]:
     yield from _online_rl_server_context_for_config(_build_config())
+
+
+def test_regex_guidance_returns_native_selected_token_logprob_with_real_checkpoint(
+        online_rl_server_context: _ServerContext, ) -> None:
+    forced_text = "@"
+    guided_payload = _forced_token_logprob_request(
+        online_rl_server_context,
+        forced_text=forced_text,
+        return_native_token_logprobs=False,
+    )
+    native_payload = _forced_token_logprob_request(
+        online_rl_server_context,
+        forced_text=forced_text,
+        return_native_token_logprobs=True,
+    )
+
+    guided_logprob = guided_payload["_test_selected_token_logprob"]
+    native_logprob = native_payload["_test_selected_token_logprob"]
+    assert guided_payload["choices"][0]["text"] == native_payload["choices"][0][
+        "text"] == forced_text
+    assert guided_payload["choices"][0]["token_ids"] == native_payload[
+        "choices"][0]["token_ids"]
+
+    # A strict one-token regex masks almost the whole vocabulary, so the
+    # normal guided logprob is close to 0. The native path must instead return
+    # the raw model logprob for the same forced token.
+    assert guided_logprob > -1e-3
+    assert native_logprob < guided_logprob - 1e-2
 
 
 def _run_torture_single_generation_with_multiple_reloads(

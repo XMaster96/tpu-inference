@@ -13,6 +13,9 @@ from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.core.sched.output import NewRequestData
 
 from tpu_inference.runner.block_table import MultiGroupBlockTable
+from tpu_inference.runner.logprob_options import (
+    RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG,
+)
 
 _SAMPLING_EPS = 1e-5
 
@@ -115,6 +118,7 @@ class InputBatch:
         self.generators: dict[int, Any] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        self.native_token_logprobs_req_ids: set[str] = set()
 
         self.logit_bias: list[Optional[dict[int,
                                             float]]] = [None] * max_num_reqs
@@ -207,6 +211,9 @@ class InputBatch:
 
         if sampling_params.logprobs is not None:
             self.num_logprobs[req_id] = sampling_params.logprobs
+        extra_args = sampling_params.extra_args or {}
+        if extra_args.get(RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG):
+            self.native_token_logprobs_req_ids.add(req_id)
         if sampling_params.logit_bias is not None:
             self.logit_bias[req_index] = sampling_params.logit_bias
 
@@ -280,6 +287,7 @@ class InputBatch:
         self.min_tokens.pop(req_index, None)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.native_token_logprobs_req_ids.discard(req_id)
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
