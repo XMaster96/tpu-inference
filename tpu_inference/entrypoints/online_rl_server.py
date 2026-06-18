@@ -28,8 +28,7 @@ from vllm.entrypoints.openai.cli_args import (
     validate_parsed_serve_args,
 )
 from vllm.entrypoints.openai.completion.protocol import (
-    CompletionResponse,
-)
+    CompletionResponse, )
 from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
@@ -47,11 +46,9 @@ from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
 from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware
 from vllm.entrypoints.serve.instrumentator.health import (
-    attach_router as attach_health_router,
-)
+    attach_router as attach_health_router, )
 from vllm.entrypoints.serve.instrumentator.metrics import (
-    attach_router as attach_metrics_router,
-)
+    attach_router as attach_metrics_router, )
 from vllm.entrypoints.utils import (
     cli_env_setup,
     load_aware_call,
@@ -67,15 +64,24 @@ from tpu_inference.entrypoints.stacked_regex import (
     install_staged_guidance_patch,
     normalize_completion_request,
 )
-from tpu_inference.models.jax.utils.weight_utils import _is_modlax_orbax_checkpoint
+from tpu_inference.models.jax.utils.weight_utils import (
+    _is_modlax_orbax_checkpoint,
+    _load_modlax_orbax_checkpoint_config,
+    get_single_modlax_adapter_config,
+    resolve_single_modlax_adapter_config,
+)
 from tpu_inference.vllm_runtime_patches import (
     apply_vllm_runtime_patches,
-    filter_scheduler_output_missing_req_indices as _shared_filter_scheduler_output_missing_req_indices,
+    filter_scheduler_output_missing_req_indices as
+    _shared_filter_scheduler_output_missing_req_indices,
     get_reload_generation as _shared_get_reload_generation,
     is_stale_scheduler_output as _shared_is_stale_scheduler_output,
-    mark_scheduler_output_reload_generation as _shared_mark_scheduler_output_reload_generation,
-    patch_async_scheduler_preempt_discard as _shared_patch_async_scheduler_preempt_discard,
-    patch_scheduler_reload_stale_output as _shared_patch_scheduler_reload_stale_output,
+    mark_scheduler_output_reload_generation as
+    _shared_mark_scheduler_output_reload_generation,
+    patch_async_scheduler_preempt_discard as
+    _shared_patch_async_scheduler_preempt_discard,
+    patch_scheduler_reload_stale_output as
+    _shared_patch_scheduler_reload_stale_output,
 )
 
 logger = init_logger("tpu_inference.entrypoints.online_rl_server")
@@ -121,11 +127,13 @@ def _get_truncated_completion_request(
     if max_input_tokens <= 0:
         return None
 
-    return request.model_copy(update={"truncate_prompt_tokens": max_input_tokens})
+    return request.model_copy(
+        update={"truncate_prompt_tokens": max_input_tokens})
 
 
 def _weights_ready(app_state) -> bool:
-    return (not app_state.require_first_reload) or app_state.first_weights_loaded.is_set()
+    return (not app_state.require_first_reload
+            ) or app_state.first_weights_loaded.is_set()
 
 
 def _get_request_admission_lock(app_state) -> asyncio.Lock:
@@ -136,7 +144,8 @@ def _get_request_admission_lock(app_state) -> asyncio.Lock:
     return lock
 
 
-def _install_request_admission_gate(app_state, engine: EngineClient) -> asyncio.Lock:
+def _install_request_admission_gate(app_state,
+                                    engine: EngineClient) -> asyncio.Lock:
     lock = _get_request_admission_lock(app_state)
     setattr(engine, "_tpu_reload_request_gate", lock)
     return lock
@@ -146,15 +155,18 @@ def _get_reload_generation(scheduler) -> int:
     return _shared_get_reload_generation(scheduler)
 
 
-def _mark_scheduler_output_reload_generation(scheduler, scheduler_output) -> None:
-    _shared_mark_scheduler_output_reload_generation(scheduler, scheduler_output)
+def _mark_scheduler_output_reload_generation(scheduler,
+                                             scheduler_output) -> None:
+    _shared_mark_scheduler_output_reload_generation(scheduler,
+                                                    scheduler_output)
 
 
 def _is_stale_scheduler_output(scheduler, scheduler_output) -> bool:
     return _shared_is_stale_scheduler_output(scheduler, scheduler_output)
 
 
-def _filter_scheduler_output_missing_req_indices(scheduler_output, model_runner_output):
+def _filter_scheduler_output_missing_req_indices(scheduler_output,
+                                                 model_runner_output):
     return _shared_filter_scheduler_output_missing_req_indices(
         scheduler_output,
         model_runner_output,
@@ -178,8 +190,7 @@ def _ensure_pause_controls_supported(engine: EngineClient) -> None:
     if missing:
         raise RuntimeError(
             "Live reload preemption requires AsyncLLM pause internals; missing: "
-            + ", ".join(missing)
-        )
+            + ", ".join(missing))
 
 
 async def _set_generation_paused(engine: EngineClient, paused: bool) -> bool:
@@ -201,8 +212,7 @@ async def _run_with_reload_timeout(
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
     except TimeoutError as exc:
         raise RuntimeError(
-            f"timeout while {step_name} after {timeout_seconds:.2f}s"
-        ) from exc
+            f"timeout while {step_name} after {timeout_seconds:.2f}s") from exc
 
 
 def _safe_len(value) -> int | None:
@@ -258,8 +268,10 @@ def _engine_state_snapshot(engine: EngineClient) -> dict[str, object]:
         "paused": getattr(engine, "_paused", None),
         "running_count": _safe_len(engine_state.get("running_requests")),
         "waiting_count": _safe_len(engine_state.get("waiting_requests")),
-        "running_ids": _request_id_sample(engine_state.get("running_requests")),
-        "waiting_ids": _request_id_sample(engine_state.get("waiting_requests")),
+        "running_ids":
+        _request_id_sample(engine_state.get("running_requests")),
+        "waiting_ids":
+        _request_id_sample(engine_state.get("waiting_requests")),
         "has_unfinished_requests": unfinished_requests,
     }
 
@@ -283,17 +295,20 @@ def _summarize_worker_results(worker_results) -> dict[str, object]:
                 for key in (
                     "status",
                     "mode",
+                    "reload_mode",
+                    "checkpoint_kind",
                     "checkpoint_path",
                     "loaded_checkpoint_path",
                     "weight_load_seconds",
                     "compile_seconds",
                     "load_seconds",
                     "total_seconds",
-                )
-                if key in result
+                ) if key in result
             }
             if not summary:
-                summary = {"keys": _truncate_values(sorted(result.keys()), limit=8)}
+                summary = {
+                    "keys": _truncate_values(sorted(result.keys()), limit=8)
+                }
         else:
             summary = {
                 "type": type(result).__name__,
@@ -304,8 +319,26 @@ def _summarize_worker_results(worker_results) -> dict[str, object]:
     return {
         "worker_count": len(entries),
         "sample": summarized_entries,
-        "omitted_workers": max(0, len(entries) - len(summarized_entries)),
+        "omitted_workers": max(0,
+                               len(entries) - len(summarized_entries)),
     }
+
+
+def _extract_worker_checkpoint_kind(worker_results) -> str | None:
+    if isinstance(worker_results, dict):
+        results = worker_results.values()
+    elif isinstance(worker_results, list):
+        results = worker_results
+    else:
+        return None
+    kinds = {
+        result.get("checkpoint_kind")
+        for result in results
+        if isinstance(result, dict) and result.get("checkpoint_kind")
+    }
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    return None
 
 
 async def _run_reload_phase(
@@ -386,8 +419,7 @@ async def _preempt_running_requests(engine: EngineClient) -> None:
     if not reset_ok:
         raise RuntimeError(
             "reset_prefix_cache returned failure while preempting "
-            "running requests"
-        )
+            "running requests")
 
 
 async def _invalidate_live_reload_worker_state(
@@ -409,15 +441,26 @@ async def _invalidate_live_reload_worker_state(
     "/v1/completions",
     dependencies=[Depends(validate_json_request)],
     responses={
-        HTTPStatus.OK.value: {"content": {"application/json": {}}},
-        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
-        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
-        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+        HTTPStatus.OK.value: {
+            "content": {
+                "application/json": {}
+            }
+        },
+        HTTPStatus.BAD_REQUEST.value: {
+            "model": ErrorResponse
+        },
+        HTTPStatus.NOT_FOUND.value: {
+            "model": ErrorResponse
+        },
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {
+            "model": ErrorResponse
+        },
     },
 )
 @with_cancellation
 @load_aware_call
-async def create_completion(request: TPUCompletionRequest, raw_request: Request):
+async def create_completion(request: TPUCompletionRequest,
+                            raw_request: Request):
     # Explicitly disable SSE streaming while preserving all non-stream
     # completion behavior from vLLM (including structured outputs handling).
     if request.stream:
@@ -425,24 +468,22 @@ async def create_completion(request: TPUCompletionRequest, raw_request: Request)
         if handler is None:
             base_server = raw_request.app.state.openai_serving_tokenization
             error = base_server.create_error_response(
-                message="The model does not support Completions API"
-            )
+                message="The model does not support Completions API")
         else:
             error = handler.create_error_response(
-                message="Streaming is disabled on this server."
-            )
-        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
+                message="Streaming is disabled on this server.")
+        return JSONResponse(content=error.model_dump(),
+                            status_code=error.error.code)
 
     metrics_header_format = raw_request.headers.get(
-        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
-    )
+        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = completion(raw_request)
     if handler is None:
         base_server = raw_request.app.state.openai_serving_tokenization
         error = base_server.create_error_response(
-            message="The model does not support Completions API"
-        )
-        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
+            message="The model does not support Completions API")
+        return JSONResponse(content=error.model_dump(),
+                            status_code=error.error.code)
 
     try:
         normalized_request = normalize_completion_request(
@@ -450,7 +491,8 @@ async def create_completion(request: TPUCompletionRequest, raw_request: Request)
             raw_request.app.state.args.structured_outputs_config.backend,
         )
         try:
-            output = await handler.create_completion(normalized_request, raw_request)
+            output = await handler.create_completion(normalized_request,
+                                                     raw_request)
         except VLLMValidationError as exc:
             retry_request = None
             if getattr(exc, "parameter", None) == "input_tokens":
@@ -462,13 +504,16 @@ async def create_completion(request: TPUCompletionRequest, raw_request: Request)
             if retry_request is None:
                 raise
 
-            output = await handler.create_completion(retry_request, raw_request)
+            output = await handler.create_completion(retry_request,
+                                                     raw_request)
     except Exception as exc:
         error = handler.create_error_response(exc)
-        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
+        return JSONResponse(content=error.model_dump(),
+                            status_code=error.error.code)
 
     if isinstance(output, ErrorResponse):
-        return JSONResponse(content=output.model_dump(), status_code=output.error.code)
+        return JSONResponse(content=output.model_dump(),
+                            status_code=output.error.code)
 
     if isinstance(output, CompletionResponse):
         return JSONResponse(
@@ -477,9 +522,9 @@ async def create_completion(request: TPUCompletionRequest, raw_request: Request)
         )
 
     error = handler.create_error_response(
-        message="Unexpected streaming output while streaming is disabled."
-    )
-    return JSONResponse(content=error.model_dump(), status_code=error.error.code)
+        message="Unexpected streaming output while streaming is disabled.")
+    return JSONResponse(content=error.model_dump(),
+                        status_code=error.error.code)
 
 
 @router.get("/v1/models")
@@ -498,7 +543,8 @@ async def status(raw_request: Request):
     app_state = raw_request.app.state
     ready = _weights_ready(app_state)
     return JSONResponse(
-        status_code=HTTPStatus.OK.value if ready else HTTPStatus.SERVICE_UNAVAILABLE.value,
+        status_code=HTTPStatus.OK.value
+        if ready else HTTPStatus.SERVICE_UNAVAILABLE.value,
         content={
             "status": "ready" if ready else "waiting_for_initial_weights",
             "ready": ready,
@@ -559,12 +605,12 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
     reload_lock_wait_started_at = time.monotonic()
 
     async with app_state.reload_lock:
-        reload_lock_wait_seconds = time.monotonic() - reload_lock_wait_started_at
+        reload_lock_wait_seconds = time.monotonic(
+        ) - reload_lock_wait_started_at
         request_gate_wait_started_at = time.monotonic()
         async with _get_request_admission_lock(app_state):
-            request_gate_wait_seconds = (
-                time.monotonic() - request_gate_wait_started_at
-            )
+            request_gate_wait_seconds = (time.monotonic() -
+                                         request_gate_wait_started_at)
             logger.info(
                 "Live reload orchestration start | reload_id=%s | "
                 "reload_lock_wait=%.3fs | request_gate_wait=%.3fs | ready=%s "
@@ -580,11 +626,9 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                 "current_checkpoint=%s | target_checkpoint=%s | clear_cache=%s | "
                 "release_kv_cache=%s | timeout_seconds=%.2f | engine=%s",
                 reload_id,
-                (
-                    "wait_for_inflight_requests"
-                    if payload.wait_for_inflight_requests
-                    else "preempt_inflight_requests"
-                ),
+                ("wait_for_inflight_requests"
+                 if payload.wait_for_inflight_requests else
+                 "preempt_inflight_requests"),
                 current_checkpoint_path,
                 target_checkpoint_path,
                 payload.clear_cache,
@@ -647,11 +691,8 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
                         timeout_seconds=payload.timeout_seconds,
                     )
 
-                rpc_args = (
-                    (payload.checkpoint_path,)
-                    if payload.checkpoint_path is not None
-                    else ()
-                )
+                rpc_args = ((payload.checkpoint_path, )
+                            if payload.checkpoint_path is not None else ())
                 current_phase = "reloading model weights"
                 worker_results = await _run_reload_phase(
                     engine.collective_rpc(
@@ -763,21 +804,102 @@ async def reload_weights(payload: ReloadWeightsRequest, raw_request: Request):
         _engine_state_snapshot(engine),
     )
 
-    return JSONResponse(
-        content={
-            "status": "ok",
-            "checkpoint_path": app_state.current_checkpoint_path,
-            "worker_results": worker_results,
-        }
+    response_content = {
+        "status": "ok",
+        "checkpoint_path": app_state.current_checkpoint_path,
+        "worker_results": worker_results,
+    }
+    checkpoint_kind = _extract_worker_checkpoint_kind(worker_results)
+    if checkpoint_kind is not None:
+        response_content["checkpoint_kind"] = checkpoint_kind
+
+    return JSONResponse(content=response_content)
+
+
+def _adapter_override_from_cli(args: Namespace) -> dict[str, object] | None:
+    adapter_name = getattr(args, "adapter_name", None) or None
+    adapter_iffm = getattr(args, "adapter_iffm", None)
+    if (adapter_name is None) != (adapter_iffm is None):
+        raise ValueError(
+            "--adapter-name and --adapter-iffm must be provided together.")
+    if adapter_name is None:
+        return None
+    return get_single_modlax_adapter_config(
+        [{
+            "name": adapter_name,
+            "iffm": adapter_iffm,
+        }],
+        "CLI adapter flags",
     )
+
+
+def _hf_override_adapters(args: Namespace):
+    hf_overrides = getattr(args, "hf_overrides", None)
+    if isinstance(hf_overrides, dict):
+        return hf_overrides.get("adapters")
+    return None
+
+
+def _resolve_initial_adapter_config(
+    args: Namespace,
+    checkpoint_config: dict[str, object] | None,
+) -> dict[str, object] | None:
+    cli_adapter = _adapter_override_from_cli(args)
+    hf_override_adapter = get_single_modlax_adapter_config(
+        _hf_override_adapters(args),
+        "hf_overrides.adapters",
+    )
+    if (cli_adapter is not None and hf_override_adapter is not None
+            and cli_adapter != hf_override_adapter):
+        raise ValueError(
+            "CLI adapter flags conflict with hf_overrides.adapters: "
+            f"cli={cli_adapter}, hf_overrides={hf_override_adapter}")
+    override_adapter = cli_adapter or hf_override_adapter
+    return resolve_single_modlax_adapter_config(
+        checkpoint_config.get("adapters") if checkpoint_config else None,
+        [override_adapter] if override_adapter is not None else None,
+        base_source="base checkpoint adapters",
+        override_source="runtime adapter override",
+    )
+
+
+def _install_adapter_hf_override(
+        args: Namespace, adapter_config: dict[str, object] | None) -> None:
+    if adapter_config is None:
+        return
+    hf_overrides = getattr(args, "hf_overrides", None)
+    if hf_overrides is None:
+        hf_overrides = {}
+    if callable(hf_overrides) or not isinstance(hf_overrides, dict):
+        raise ValueError(
+            "Modlax adapter support requires dict-valued hf_overrides.")
+    existing_adapter = get_single_modlax_adapter_config(
+        hf_overrides.get("adapters"),
+        "hf_overrides.adapters",
+    )
+    if existing_adapter is not None and existing_adapter != adapter_config:
+        raise ValueError(
+            "Resolved Modlax adapter conflicts with hf_overrides.adapters: "
+            f"resolved={adapter_config}, hf_overrides={existing_adapter}")
+    updated_hf_overrides = dict(hf_overrides)
+    updated_hf_overrides["adapters"] = [adapter_config]
+    args.hf_overrides = updated_hf_overrides
 
 
 def _configure_initial_reload_mode(args: Namespace) -> tuple[bool, str | None]:
     checkpoint_path = getattr(args, "model_weights", None) or None
+    checkpoint_config = None
+    if checkpoint_path is not None and _is_modlax_orbax_checkpoint(
+            checkpoint_path):
+        checkpoint_config = _load_modlax_orbax_checkpoint_config(
+            checkpoint_path)
+    adapter_config = _resolve_initial_adapter_config(args, checkpoint_config)
+    _install_adapter_hf_override(args, adapter_config)
+
     if checkpoint_path is None:
         return False, None
 
-    if _is_modlax_orbax_checkpoint(checkpoint_path):
+    if checkpoint_config is not None:
         return False, checkpoint_path
 
     logger.warning(
@@ -795,7 +917,9 @@ def _configure_initial_reload_mode(args: Namespace) -> tuple[bool, str | None]:
 
 def _install_weight_gate(app: FastAPI) -> None:
     health_paths = {"/health", "/ping", "/status"}
-    public_paths = {"/metrics", "/v1/reload_weights", "/openapi.json", "/redoc"}
+    public_paths = {
+        "/metrics", "/v1/reload_weights", "/openapi.json", "/redoc"
+    }
 
     @app.middleware("http")
     async def reject_until_first_real_weights(request: Request, call_next):
@@ -821,12 +945,12 @@ def _install_weight_gate(app: FastAPI) -> None:
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             content={
                 "error": {
-                    "message": (
-                        "Model weights are not loaded yet. "
-                        "Call /v1/reload_weights and retry."
-                    ),
-                    "type": "service_unavailable",
-                    "code": HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    "message": ("Model weights are not loaded yet. "
+                                "Call /v1/reload_weights and retry."),
+                    "type":
+                    "service_unavailable",
+                    "code":
+                    HTTPStatus.SERVICE_UNAVAILABLE.value,
                 }
             },
         )
@@ -873,8 +997,7 @@ def build_minimal_app(args: Namespace) -> FastAPI:
     if envs.VLLM_DEBUG_LOG_API_SERVER_RESPONSE:
         logger.warning(
             "CAUTION: Enabling API response logging. "
-            "This may include sensitive data and is not recommended in prod."
-        )
+            "This may include sensitive data and is not recommended in prod.")
         app.middleware("http")(log_response)
 
     for middleware in args.middleware:
@@ -898,7 +1021,8 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     decorate_logs("OnlineRLServer")
     apply_vllm_runtime_patches()
     install_staged_guidance_patch()
-    require_first_reload, checkpoint_path = _configure_initial_reload_mode(args)
+    require_first_reload, checkpoint_path = _configure_initial_reload_mode(
+        args)
 
     listen_address, sock = setup_server(args)
 
@@ -957,22 +1081,38 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
 
 if __name__ == "__main__":
     cli_env_setup()
-    parser = FlexibleArgumentParser(
-        description=(
-            "Minimal TPU online-RL server: /health, /metrics, /v1/models, "
-            "/v1/completions (non-stream), /v1/reload_weights"
-        )
-    )
+    parser = FlexibleArgumentParser(description=(
+        "Minimal TPU online-RL server: /health, /metrics, /v1/models, "
+        "/v1/completions (non-stream), /v1/reload_weights"))
     parser = make_arg_parser(parser)
     parser.add_argument(
         "--model-weights",
         dest="model_weights",
         type=str,
         default="",
-        help=(
-            "Optional model weights URI/path for TPU Orbax loading. "
-            "Use with --model pointing to a local HF config/tokenizer directory."
-        ),
+        help=
+        ("Optional model weights URI/path for TPU Orbax loading. "
+         "Use with --model pointing to a local HF config/tokenizer directory."
+         ),
+    )
+    parser.add_argument(
+        "--adapter-name",
+        dest="adapter_name",
+        type=str,
+        default=None,
+        help=
+        ("Optional single Modlax adapter name. Must be used with "
+         "--adapter-iffm. If the base checkpoint has no adapter, the "
+         "runtime adapter is initialized to zeros until weights are reloaded."
+         ),
+    )
+    parser.add_argument(
+        "--adapter-iffm",
+        dest="adapter_iffm",
+        type=float,
+        default=None,
+        help=("Optional Modlax adapter intermediate multiplier. Must be used "
+              "with --adapter-name."),
     )
     args = parser.parse_args()
     validate_parsed_serve_args(args)

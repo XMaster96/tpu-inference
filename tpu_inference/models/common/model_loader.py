@@ -34,11 +34,11 @@ from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     apply_qwix_on_abstract_model, apply_qwix_quantization,
     load_random_weights_into_qwix_abstract_model,
     update_vllm_config_for_qwix_quantization)
-from tpu_inference.models.jax.utils.weight_utils import (BaseWeightLoader,
-                                                         LoadableWithIterator,
-                                                         _is_modlax_orbax_checkpoint,
-                                                         _load_modlax_orbax_checkpoint_config,
-                                                         _resolve_modlax_orbax_checkpoint_path)
+from tpu_inference.models.jax.utils.weight_utils import (
+    BaseWeightLoader, LoadableWithIterator, _is_modlax_orbax_checkpoint,
+    _load_modlax_orbax_checkpoint_config,
+    _resolve_modlax_orbax_checkpoint_path, normalize_modlax_adapter_configs,
+    resolve_single_modlax_adapter_config)
 from tpu_inference.utils import to_jax_dtype, to_torch_dtype
 
 logger = init_logger(__name__)
@@ -72,8 +72,8 @@ def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
     return None
 
 
-def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
-                                             ) -> LlamaConfig:
+def _build_hf_llama_config_from_modlax_orbax(
+        checkpoint_config: dict[str, Any]) -> LlamaConfig:
     rope_scaling = checkpoint_config.get("rope_scaling")
     # Modlax stores scalar rope scaling for the default RoPE path while HF
     # expects None or a rope_scaling dictionary.
@@ -87,14 +87,16 @@ def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
         if not isinstance(rope_yarn_config, dict):
             raise ValueError(
                 "Modlax Orbax checkpoint declares rope_type='yarn' but is "
-                "missing a rope_yarn_config mapping."
-            )
+                "missing a rope_yarn_config mapping.")
         rope_scaling = {
-            "type": "yarn",
-            "rope_type": "yarn",
-            "factor": float(rope_yarn_config["factor"]),
-            "original_max_position_embeddings": float(
-                rope_yarn_config["original_max_position_embeddings"]),
+            "type":
+            "yarn",
+            "rope_type":
+            "yarn",
+            "factor":
+            float(rope_yarn_config["factor"]),
+            "original_max_position_embeddings":
+            float(rope_yarn_config["original_max_position_embeddings"]),
         }
         for optional_key in (
                 "attention_factor",
@@ -119,8 +121,7 @@ def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
         if attn_factor is not None and attn_factor != attention_factor:
             raise ValueError(
                 "Found conflicting attention_factor and attn_factor values in "
-                "Modlax Orbax rope_scaling."
-            )
+                "Modlax Orbax rope_scaling.")
         rope_scaling["attn_factor"] = attention_factor
 
     llama_4_scaling = None
@@ -130,30 +131,44 @@ def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
             "original_max_position_embeddings")
         if scaling_beta is not None and original_max_position_embeddings is not None:
             llama_4_scaling = {
-                "beta": float(scaling_beta),
+                "beta":
+                float(scaling_beta),
                 "original_max_position_embeddings":
                 float(original_max_position_embeddings),
             }
 
     hf_kwargs: dict[str, Any] = {
         "architectures": ["LlamaForCausalLM"],
-        "hidden_size": int(checkpoint_config["hidden_size"]),
-        "intermediate_size": int(checkpoint_config["intermediate_size"]),
-        "num_hidden_layers": int(checkpoint_config["num_hidden_layers"]),
-        "num_attention_heads": int(checkpoint_config["num_attention_heads"]),
-        "num_key_value_heads": int(checkpoint_config["num_key_value_heads"]),
-        "head_dim": int(checkpoint_config["head_dim"]),
-        "vocab_size": int(checkpoint_config["vocab_size"]),
+        "hidden_size":
+        int(checkpoint_config["hidden_size"]),
+        "intermediate_size":
+        int(checkpoint_config["intermediate_size"]),
+        "num_hidden_layers":
+        int(checkpoint_config["num_hidden_layers"]),
+        "num_attention_heads":
+        int(checkpoint_config["num_attention_heads"]),
+        "num_key_value_heads":
+        int(checkpoint_config["num_key_value_heads"]),
+        "head_dim":
+        int(checkpoint_config["head_dim"]),
+        "vocab_size":
+        int(checkpoint_config["vocab_size"]),
         "max_position_embeddings":
         int(checkpoint_config["max_position_embeddings"]),
-        "rope_theta": float(checkpoint_config["rope_theta"]),
-        "rope_scaling": rope_scaling,
-        "hidden_act": checkpoint_config.get("hidden_act", "silu"),
-        "rms_norm_eps": float(checkpoint_config.get("rms_norm_eps", 1e-5)),
+        "rope_theta":
+        float(checkpoint_config["rope_theta"]),
+        "rope_scaling":
+        rope_scaling,
+        "hidden_act":
+        checkpoint_config.get("hidden_act", "silu"),
+        "rms_norm_eps":
+        float(checkpoint_config.get("rms_norm_eps", 1e-5)),
         "tie_word_embeddings":
         bool(checkpoint_config.get("tie_word_embeddings", True)),
-        "attention_bias": bool(checkpoint_config.get("attention_bias", False)),
-        "mlp_bias": bool(checkpoint_config.get("mlp_bias", False)),
+        "attention_bias":
+        bool(checkpoint_config.get("attention_bias", False)),
+        "mlp_bias":
+        bool(checkpoint_config.get("mlp_bias", False)),
         "attention_dropout":
         float(checkpoint_config.get("attention_dropout", 0.0)),
         "initializer_range":
@@ -161,11 +176,24 @@ def _build_hf_llama_config_from_modlax_orbax(checkpoint_config: dict[str, Any]
     }
     if llama_4_scaling is not None:
         hf_kwargs["llama_4_scaling"] = llama_4_scaling
+    adapters = normalize_modlax_adapter_configs(
+        checkpoint_config.get("adapters"),
+        "Modlax checkpoint adapters",
+    )
+    if adapters:
+        hf_kwargs["adapters"] = adapters
     return LlamaConfig(**hf_kwargs)
 
 
+def _modlax_hf_override_adapters(vllm_config: VllmConfig) -> Any:
+    hf_overrides = getattr(vllm_config.model_config, "hf_overrides", None)
+    if isinstance(hf_overrides, dict):
+        return hf_overrides.get("adapters")
+    return None
+
+
 def _maybe_override_hf_config_with_modlax_orbax(vllm_config: VllmConfig,
-                                                 is_draft_model: bool) -> None:
+                                                is_draft_model: bool) -> None:
     checkpoint_path = _select_modlax_orbax_checkpoint_path(
         vllm_config, is_draft_model)
     if checkpoint_path is None:
@@ -174,7 +202,16 @@ def _maybe_override_hf_config_with_modlax_orbax(vllm_config: VllmConfig,
                None) == checkpoint_path:
         return
 
-    checkpoint_config = _load_modlax_orbax_checkpoint_config(checkpoint_path)
+    checkpoint_config = dict(
+        _load_modlax_orbax_checkpoint_config(checkpoint_path))
+    adapter_config = resolve_single_modlax_adapter_config(
+        checkpoint_config.get("adapters"),
+        _modlax_hf_override_adapters(vllm_config),
+        base_source="Modlax checkpoint adapters",
+        override_source="hf_overrides.adapters",
+    )
+    if adapter_config is not None:
+        checkpoint_config["adapters"] = [adapter_config]
     hf_config = _build_hf_llama_config_from_modlax_orbax(checkpoint_config)
     vllm_config.model_config.hf_config = hf_config
     # Some vLLM code paths read from hf_text_config.
@@ -356,7 +393,8 @@ def _get_nnx_model(
                     # weights_iterator keyword argument.
                     vllm_config.model_config.runai_model_weights_iterator = weights_iterator
                 model.load_weights(rng)
-                if hasattr(vllm_config.model_config, "runai_model_weights_iterator"):
+                if hasattr(vllm_config.model_config,
+                           "runai_model_weights_iterator"):
                     del vllm_config.model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)

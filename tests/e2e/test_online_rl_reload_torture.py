@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -12,37 +14,57 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 import pytest
 import requests
 
 pytestmark = pytest.mark.online_rl_server_related
 
-
 DEFAULT_ORBAX_CHECKPOINT = (
     "gs://ml-flops-checkpoints-us-central2/"
     "9k_books--batch_size=64-num_epochs=1-lr_milestones="
     "LR({in_stp=25;lr=1e-06;linear}->{lr=0;cosine})-"
     "mistral_24b-seq_lens=16384-use_stochastic_rounding_smooth-"
-    "orpo_beta=1---run_1"
-)
+    "orpo_beta=1---run_1")
 DEFAULT_HF_MODEL_DIR = (
     "/dev/shm/ml-flops-checkpoints-us-central2/"
     "9k_books--batch_size=64-num_epochs=1-lr_milestones="
     "LR({in_stp=25;lr=1e-06;linear}->{lr=0;cosine})-"
     "mistral_24b-seq_lens=16384-use_stochastic_rounding_smooth-"
-    "orpo_beta=1---run_1"
-)
+    "orpo_beta=1---run_1")
+LOCAL_MISTRAL3_14B_MODEL_DIR = (
+    "/dev/shm/9k_books_new_arc_summary-stage_2-self_attn_plus_mlp_gate_only---"
+    "batch_size=24-num_epochs=6-lr_milestones=LR({in_stp=25;lr=2e-05;linear}->"
+    "{lr=0;cosine})-mistral3_14b_base-seq_lens=262144-"
+    "qk_clip_max_attention_logit_score=85---run_1")
+LOCAL_MISTRAL3_14B_ORBAX_CHECKPOINT = "/dev/shm/buffer--orbax"
+DEFAULT_ADAPTER_NAME = "e2e_adapter"
+DEFAULT_ADAPTER_IFFM = 0.125
+ADAPTER_CHECKPOINT_VALUE = 1e-6
+
+
+def _default_model_dir() -> str:
+    if os.path.exists(LOCAL_MISTRAL3_14B_MODEL_DIR):
+        return LOCAL_MISTRAL3_14B_MODEL_DIR
+    return DEFAULT_HF_MODEL_DIR
+
+
+def _default_orbax_checkpoints() -> str:
+    if os.path.exists(LOCAL_MISTRAL3_14B_ORBAX_CHECKPOINT):
+        return LOCAL_MISTRAL3_14B_ORBAX_CHECKPOINT
+    return DEFAULT_ORBAX_CHECKPOINT
+
 
 @dataclass
 class _E2EConfig:
     model_dir: str
     tokenizer_dir: str
     reload_checkpoints: list[str]
+    initial_reload_checkpoint: str | None
     startup_dummy_weights_path: str
     host: str
     port: int
@@ -62,6 +84,8 @@ class _E2EConfig:
     continuous_reload_interval_seconds: float
     continuous_reload_min_cycles: int
     continuous_reload_max_cycles: int
+    adapter_name: str | None
+    adapter_iffm: float | None
 
 
 @dataclass
@@ -83,13 +107,15 @@ def _pick_free_port() -> int:
 
 def _build_config() -> _E2EConfig:
     model_dir = os.environ.get("TPU_ONLINE_RL_E2E_MODEL_DIR",
-                               DEFAULT_HF_MODEL_DIR)
+                               _default_model_dir())
     tokenizer_dir = os.environ.get("TPU_ONLINE_RL_E2E_TOKENIZER_DIR",
                                    model_dir)
 
     raw_checkpoints = os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_CHECKPOINTS",
-                                     DEFAULT_ORBAX_CHECKPOINT)
-    reload_checkpoints = [p.strip() for p in raw_checkpoints.split(",") if p.strip()]
+                                     _default_orbax_checkpoints())
+    reload_checkpoints = [
+        p.strip() for p in raw_checkpoints.split(",") if p.strip()
+    ]
     assert reload_checkpoints, (
         "TPU_ONLINE_RL_E2E_RELOAD_CHECKPOINTS resolved to an empty list.")
 
@@ -102,17 +128,20 @@ def _build_config() -> _E2EConfig:
         model_dir=model_dir,
         tokenizer_dir=tokenizer_dir,
         reload_checkpoints=reload_checkpoints,
+        initial_reload_checkpoint=None,
         startup_dummy_weights_path=startup_dummy_weights_path,
         host="127.0.0.1",
         port=int(os.environ.get("TPU_ONLINE_RL_E2E_PORT", _pick_free_port())),
         tensor_parallel_size=int(os.environ.get("TPU_ONLINE_RL_E2E_TP", "4")),
-        max_model_len=int(os.environ.get("TPU_ONLINE_RL_E2E_MAX_MODEL_LEN",
-                                         "16384")),
+        max_model_len=int(
+            os.environ.get("TPU_ONLINE_RL_E2E_MAX_MODEL_LEN", "16384")),
         max_num_batched_tokens=int(
             os.environ.get("TPU_ONLINE_RL_E2E_MAX_BATCHED_TOKENS", "32768")),
-        max_num_seqs=int(os.environ.get("TPU_ONLINE_RL_E2E_MAX_NUM_SEQS", "64")),
+        max_num_seqs=int(os.environ.get("TPU_ONLINE_RL_E2E_MAX_NUM_SEQS",
+                                        "64")),
         reload_timeout_seconds=int(
-            os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_TIMEOUT_SECONDS", "7200")),
+            os.environ.get("TPU_ONLINE_RL_E2E_RELOAD_TIMEOUT_SECONDS",
+                           "7200")),
         completion_timeout_seconds=int(
             os.environ.get("TPU_ONLINE_RL_E2E_COMPLETION_TIMEOUT_SECONDS",
                            "7200")),
@@ -131,14 +160,247 @@ def _build_config() -> _E2EConfig:
         parallel_generations=int(
             os.environ.get("TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS", "2")),
         continuous_reload_interval_seconds=float(
-            os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_INTERVAL_SECONDS",
-                           "0.2")),
+            os.environ.get(
+                "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_INTERVAL_SECONDS",
+                "0.2")),
         continuous_reload_min_cycles=int(
             os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES",
                            "4")),
         continuous_reload_max_cycles=int(
             os.environ.get("TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MAX_CYCLES",
                            "12")),
+        adapter_name=None,
+        adapter_iffm=None,
+    )
+
+
+def _load_hf_json_config(model_dir: str) -> dict[str, Any]:
+    config_path = Path(model_dir) / "config.json"
+    with open(config_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    assert isinstance(payload,
+                      dict), f"{config_path} did not decode to a JSON object."
+    return payload
+
+
+def _adapter_checkpoint_default_path(adapter_name: str,
+                                     adapter_iffm: float) -> str:
+    if os.path.exists("/dev/shm"):
+        safe_iffm = str(adapter_iffm).replace(".", "_")
+        return f"/dev/shm/tpu-online-rl-e2e-{adapter_name}-iffm-{safe_iffm}"
+    return str(
+        Path(tempfile.gettempdir()) /
+        f"tpu-online-rl-e2e-{adapter_name}-iffm-{adapter_iffm}")
+
+
+def _build_adapter_config() -> _E2EConfig:
+    cfg = _build_config()
+    adapter_name = os.environ.get("TPU_ONLINE_RL_E2E_ADAPTER_NAME",
+                                  DEFAULT_ADAPTER_NAME)
+    adapter_iffm = float(
+        os.environ.get("TPU_ONLINE_RL_E2E_ADAPTER_IFFM",
+                       str(DEFAULT_ADAPTER_IFFM)))
+    adapter_checkpoint = os.environ.get(
+        "TPU_ONLINE_RL_E2E_ADAPTER_RELOAD_CHECKPOINT",
+        _adapter_checkpoint_default_path(adapter_name, adapter_iffm),
+    )
+    return replace(
+        cfg,
+        reload_checkpoints=[adapter_checkpoint],
+        initial_reload_checkpoint=cfg.reload_checkpoints[0],
+        adapter_name=adapter_name,
+        adapter_iffm=adapter_iffm,
+    )
+
+
+def _checkpoint_data_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(file.stat().st_size for file in path.rglob("*")
+               if file.is_file())
+
+
+def _adapter_checkpoint_is_ready(path: str, adapter_name: str,
+                                 adapter_iffm: float,
+                                 min_data_bytes: int) -> bool:
+    checkpoint_path = Path(path)
+    if not ((checkpoint_path / "_CHECKPOINT_METADATA").exists() and
+            (checkpoint_path / "adapter_config.yml").exists()):
+        return False
+    try:
+        import yaml
+
+        payload = yaml.safe_load(
+            (checkpoint_path /
+             "adapter_config.yml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if not (payload.get("name") == adapter_name
+            and float(payload.get("iffm")) == adapter_iffm):
+        return False
+    return _checkpoint_data_bytes(checkpoint_path) >= min_data_bytes
+
+
+def _ensure_modlax_adapter_checkpoint(cfg: _E2EConfig) -> None:
+    assert cfg.adapter_name is not None
+    assert cfg.adapter_iffm is not None
+    checkpoint_path = cfg.reload_checkpoints[0]
+    hf_config = _load_hf_json_config(cfg.model_dir)
+    hidden_size = int(hf_config["hidden_size"])
+    num_layers = int(hf_config["num_hidden_layers"])
+    adapter_hidden_size = int(hidden_size * cfg.adapter_iffm)
+    assert adapter_hidden_size > 0, (
+        f"Adapter iffm {cfg.adapter_iffm} resolves to hidden size "
+        f"{adapter_hidden_size}.")
+    dtype_name = str(
+        hf_config.get("dtype", hf_config.get("torch_dtype", "bfloat16")))
+    expected_data_bytes = num_layers * 4 * hidden_size * adapter_hidden_size * 2
+    if _adapter_checkpoint_is_ready(
+            checkpoint_path,
+            cfg.adapter_name,
+            cfg.adapter_iffm,
+            min_data_bytes=expected_data_bytes // 2,
+    ):
+        return
+
+    path = Path(checkpoint_path)
+    if path.exists():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    generator = r'''
+import argparse
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import orbax.checkpoint as ocp
+import yaml
+
+
+def _dtype(name: str):
+    normalized = name.lower().replace("torch.", "")
+    if normalized in ("bfloat16", "bf16"):
+        return jnp.bfloat16
+    if normalized in ("float16", "f16"):
+        return jnp.float16
+    if normalized in ("float32", "f32"):
+        return jnp.float32
+    raise ValueError(f"Unsupported adapter checkpoint dtype: {name}")
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--path", required=True)
+parser.add_argument("--name", required=True)
+parser.add_argument("--iffm", required=True, type=float)
+parser.add_argument("--hidden-size", required=True, type=int)
+parser.add_argument("--adapter-hidden-size", required=True, type=int)
+parser.add_argument("--num-layers", required=True, type=int)
+parser.add_argument("--dtype", required=True)
+parser.add_argument("--value", required=True, type=float)
+args = parser.parse_args()
+
+dtype = _dtype(args.dtype)
+key = jax.random.PRNGKey(0)
+
+
+def _adapter_array(shape: tuple[int, int]):
+    global key
+    key, subkey = jax.random.split(key)
+    values = jax.random.uniform(
+        subkey,
+        shape=shape,
+        dtype=jnp.float32,
+        minval=-args.value,
+        maxval=args.value,
+    )
+    return values.astype(dtype)
+
+
+params = {}
+for layer_index in range(args.num_layers):
+    params[f"layers_{layer_index}"] = {
+        "adapters": {
+            args.name: {
+                "attention": {
+                    "in_proj": {
+                        "kernel": _adapter_array(
+                            (args.hidden_size, args.adapter_hidden_size),
+                        ),
+                    },
+                    "out_proj": {
+                        "kernel": _adapter_array(
+                            (args.adapter_hidden_size, args.hidden_size),
+                        ),
+                    },
+                },
+                "mlp": {
+                    "in_proj": {
+                        "kernel": _adapter_array(
+                            (args.hidden_size, args.adapter_hidden_size),
+                        ),
+                    },
+                    "out_proj": {
+                        "kernel": _adapter_array(
+                            (args.adapter_hidden_size, args.hidden_size),
+                        ),
+                    },
+                },
+            },
+        },
+    }
+
+params = jax.tree_util.tree_map(jax.block_until_ready, params)
+checkpoint_path = Path(args.path)
+with ocp.StandardCheckpointer() as checkpointer:
+    checkpointer.save(str(checkpoint_path), params, force=True)
+    wait = getattr(checkpointer, "wait_until_finished", None)
+    if callable(wait):
+        wait()
+
+adapter_config = yaml.safe_dump(
+    {"name": args.name, "iffm": args.iffm},
+    sort_keys=True,
+    default_flow_style=False,
+)
+if not adapter_config.endswith("\n"):
+    adapter_config += "\n"
+(checkpoint_path / "adapter_config.yml").write_text(
+    adapter_config,
+    encoding="utf-8",
+)
+'''
+    env = os.environ.copy()
+    env["JAX_PLATFORMS"] = "cpu"
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            generator,
+            "--path",
+            checkpoint_path,
+            "--name",
+            cfg.adapter_name,
+            "--iffm",
+            str(cfg.adapter_iffm),
+            "--hidden-size",
+            str(hidden_size),
+            "--adapter-hidden-size",
+            str(adapter_hidden_size),
+            "--num-layers",
+            str(num_layers),
+            "--dtype",
+            dtype_name,
+            "--value",
+            str(ADAPTER_CHECKPOINT_VALUE),
+        ],
+        check=True,
+        env=env,
+        timeout=1800,
     )
 
 
@@ -161,7 +423,8 @@ def _get_prompt_token_counter(tokenizer_dir: str) -> Callable[[str], int]:
             return_token_type_ids=False,
         )
         input_ids = encoded["input_ids"]
-        assert isinstance(input_ids, list), "tokenizer returned non-list input_ids"
+        assert isinstance(input_ids,
+                          list), "tokenizer returned non-list input_ids"
         return len(input_ids)
 
     return count_prompt_tokens
@@ -196,9 +459,8 @@ def _wait_for_http_or_crash(ctx: _ServerContext) -> None:
             pass
         time.sleep(1)
 
-    raise AssertionError(
-        f"Online RL server did not become reachable within "
-        f"{ctx.config.server_start_timeout_seconds}s")
+    raise AssertionError(f"Online RL server did not become reachable within "
+                         f"{ctx.config.server_start_timeout_seconds}s")
 
 
 def _reload_weights(
@@ -238,11 +500,9 @@ def _resolve_model_info(ctx: _ServerContext) -> tuple[str, int]:
     model_id = model.get("id")
     max_model_len = model.get("max_model_len")
     resolved_model_name = str(model_id) if model_id else ctx.config.model_dir
-    resolved_max_model_len = (
-        max_model_len
-        if isinstance(max_model_len, int) and max_model_len > 0
-        else ctx.config.max_model_len
-    )
+    resolved_max_model_len = (max_model_len if isinstance(max_model_len, int)
+                              and max_model_len > 0 else
+                              ctx.config.max_model_len)
     return resolved_model_name, resolved_max_model_len
 
 
@@ -263,8 +523,7 @@ def _make_long_prompt(repeat_count: int, *, seed: int) -> str:
     for i in range(repeat_count):
         chunks.append(
             f"[{seed:03d}:{i:05d}] Keep structure stable across reloads. "
-            f"Emit coherent technical prose with punctuation and line breaks."
-        )
+            f"Emit coherent technical prose with punctuation and line breaks.")
     return "\n".join(chunks)
 
 
@@ -276,8 +535,8 @@ def _make_budgeted_long_prompt(
 ) -> str:
     count_prompt_tokens = _get_prompt_token_counter(ctx.config.tokenizer_dir)
     safety_margin = max(256, min(1024, ctx.effective_max_model_len // 8))
-    prompt_token_budget = (
-        ctx.effective_max_model_len - ctx.config.max_tokens - safety_margin)
+    prompt_token_budget = (ctx.effective_max_model_len -
+                           ctx.config.max_tokens - safety_margin)
     prompt_token_budget = max(512, prompt_token_budget)
 
     sample_repeats = min(max(repeat_count, 1), 16)
@@ -301,9 +560,9 @@ def _make_budgeted_long_prompt(
 
 
 def _make_complex_regex() -> str:
-    # Keep the regex broad enough to exercise constrained decoding, but avoid
-    # nested repetition that can trigger backend-specific lexer blowups.
-    return r"^(?:[A-Za-z0-9 _.,;:!?()\[\]{}'\"/\-\n\t]{32,4096})$"
+    # Keep constrained decoding active without making reload torture sensitive
+    # to the exact character vocabulary emitted by a checkpoint.
+    return r"^(?:[\s\S]{1,4096})$"
 
 
 def _completion_request(
@@ -341,16 +600,15 @@ def _completion_request(
         f"{response.text[:4000]}")
     payload = response.json()
     choices = payload.get("choices")
-    assert isinstance(choices, list) and choices, "Completion returned no choices."
+    assert isinstance(choices,
+                      list) and choices, "Completion returned no choices."
     text = choices[0].get("text")
     assert isinstance(text, str) and text, "Completion returned empty text."
     return payload
 
 
-@pytest.fixture(scope="module")
-def online_rl_server_context() -> _ServerContext:
-    cfg = _build_config()
-
+def _online_rl_server_context_for_config(
+        cfg: _E2EConfig) -> Generator[_ServerContext, None, None]:
     assert cfg.parallel_generations >= 1, (
         "TPU_ONLINE_RL_E2E_PARALLEL_GENERATIONS must be >= 1")
     assert cfg.reloads_per_generation >= 1, (
@@ -360,6 +618,8 @@ def online_rl_server_context() -> _ServerContext:
     assert cfg.continuous_reload_max_cycles >= cfg.continuous_reload_min_cycles, (
         "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MAX_CYCLES must be >= "
         "TPU_ONLINE_RL_E2E_CONTINUOUS_RELOAD_MIN_CYCLES")
+    if cfg.adapter_name is not None:
+        _ensure_modlax_adapter_checkpoint(cfg)
 
     repo_root = Path(__file__).resolve().parents[2]
     stdout_file = tempfile.NamedTemporaryFile(prefix="online-rl-e2e-stdout-",
@@ -396,6 +656,14 @@ def online_rl_server_context() -> _ServerContext:
         "--model-weights",
         cfg.startup_dummy_weights_path,
     ]
+    if cfg.adapter_name is not None:
+        assert cfg.adapter_iffm is not None
+        command.extend([
+            "--adapter-name",
+            cfg.adapter_name,
+            "--adapter-iffm",
+            str(cfg.adapter_iffm),
+        ])
 
     env = os.environ.copy()
     env.setdefault("MODEL_IMPL_TYPE", "flax_nnx")
@@ -426,7 +694,8 @@ def online_rl_server_context() -> _ServerContext:
         _wait_for_http_or_crash(ctx)
         _reload_weights(
             ctx,
-            checkpoint_path=cfg.reload_checkpoints[0],
+            checkpoint_path=(cfg.initial_reload_checkpoint
+                             or cfg.reload_checkpoints[0]),
             wait_for_inflight_requests=True,
             clear_cache=True,
         )
@@ -447,10 +716,13 @@ def online_rl_server_context() -> _ServerContext:
                 pass
 
 
-def test_torture_single_generation_with_multiple_reloads(
-    online_rl_server_context: _ServerContext,
-) -> None:
-    ctx = online_rl_server_context
+@pytest.fixture(scope="module")
+def online_rl_server_context() -> Generator[_ServerContext, None, None]:
+    yield from _online_rl_server_context_for_config(_build_config())
+
+
+def _run_torture_single_generation_with_multiple_reloads(
+        ctx: _ServerContext) -> None:
     regex = _make_complex_regex()
     prompt = _make_budgeted_long_prompt(
         ctx,
@@ -502,10 +774,14 @@ def test_torture_single_generation_with_multiple_reloads(
         "Completion did not match regex after multi-reload torture.")
 
 
-def test_torture_parallel_generations_with_reload_storm(
-    online_rl_server_context: _ServerContext,
-) -> None:
-    ctx = online_rl_server_context
+def test_torture_single_generation_with_multiple_reloads(
+    online_rl_server_context: _ServerContext, ) -> None:
+    _run_torture_single_generation_with_multiple_reloads(
+        online_rl_server_context)
+
+
+def _run_torture_parallel_generations_with_reload_storm(
+        ctx: _ServerContext) -> None:
     regex = _make_complex_regex()
 
     prompts = [
@@ -513,11 +789,11 @@ def test_torture_parallel_generations_with_reload_storm(
             ctx,
             repeat_count=max(512, ctx.config.prompt_repeat_count // 2),
             seed=100 + i,
-        )
-        for i in range(ctx.config.parallel_generations)
+        ) for i in range(ctx.config.parallel_generations)
     ]
 
-    with ThreadPoolExecutor(max_workers=ctx.config.parallel_generations) as pool:
+    with ThreadPoolExecutor(
+            max_workers=ctx.config.parallel_generations) as pool:
         futures = [
             pool.submit(_completion_request, ctx, prompt=prompt, regex=regex)
             for prompt in prompts
@@ -552,10 +828,13 @@ def test_torture_parallel_generations_with_reload_storm(
             "At least one completion violated regex after reload storm.")
 
 
-def test_torture_continuous_reload_soak(
-    online_rl_server_context: _ServerContext,
-) -> None:
-    ctx = online_rl_server_context
+def test_torture_parallel_generations_with_reload_storm(
+    online_rl_server_context: _ServerContext, ) -> None:
+    _run_torture_parallel_generations_with_reload_storm(
+        online_rl_server_context)
+
+
+def _run_torture_continuous_reload_soak(ctx: _ServerContext) -> None:
     regex = _make_complex_regex()
 
     prompts = [
@@ -563,11 +842,11 @@ def test_torture_continuous_reload_soak(
             ctx,
             repeat_count=ctx.config.prompt_repeat_count,
             seed=200 + i,
-        )
-        for i in range(ctx.config.parallel_generations)
+        ) for i in range(ctx.config.parallel_generations)
     ]
 
-    with ThreadPoolExecutor(max_workers=ctx.config.parallel_generations) as pool:
+    with ThreadPoolExecutor(
+            max_workers=ctx.config.parallel_generations) as pool:
         futures = [
             pool.submit(_completion_request, ctx, prompt=prompt, regex=regex)
             for prompt in prompts
@@ -610,4 +889,10 @@ def test_torture_continuous_reload_soak(
     for payload in results:
         text = payload["choices"][0]["text"]
         assert re.fullmatch(regex, text) is not None, (
-            "At least one completion violated regex after continuous reload soak.")
+            "At least one completion violated regex after continuous reload soak."
+        )
+
+
+def test_torture_continuous_reload_soak(
+    online_rl_server_context: _ServerContext, ) -> None:
+    _run_torture_continuous_reload_soak(online_rl_server_context)

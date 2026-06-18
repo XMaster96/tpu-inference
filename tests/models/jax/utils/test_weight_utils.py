@@ -33,10 +33,15 @@ from tpu_inference.layers.jax.linear import JaxLinear
 from tpu_inference.models.jax.utils.weight_utils import (
     LoadableWithIterator,
     MetadataMap,
+    _build_modlax_llama_adapter_restore_template,
     _build_modlax_llama_restore_template,
+    _is_modlax_adapter_orbax_checkpoint,
     _is_modlax_orbax_checkpoint,
+    _iter_modlax_llama_adapter_hf_weights,
     _iter_modlax_llama_hf_weights,
+    _load_modlax_adapter_checkpoint_config,
     _load_modlax_orbax_checkpoint_config,
+    _resolve_modlax_adapter_orbax_checkpoint_path,
     _resolve_modlax_orbax_checkpoint_path,
     load_hf_weights,
 )
@@ -121,6 +126,7 @@ class TestJaxAutoWeightsLoader:
                                    rtol=1e-3,
                                    atol=1e-2)
 
+
 @pytest.mark.online_rl_server_related
 class TestModlaxOrbaxLlamaSupport:
 
@@ -141,17 +147,51 @@ class TestModlaxOrbaxLlamaSupport:
             "num_routing_experts": None,
         }
 
-        template = _build_modlax_llama_restore_template(checkpoint_config, mesh)
+        template = _build_modlax_llama_restore_template(
+            checkpoint_config, mesh)
 
         assert template["token_embed"].shape == (32, 8)
         assert template["token_embed"].dtype == jnp.bfloat16
         assert template["token_embed"].sharding.spec == P(None, "model")
-        assert template["layers_0"]["self_attn"]["q_proj"]["kernel"].shape == (8, 8)
-        assert template["layers_0"]["self_attn"]["o_proj"]["kernel"].shape == (8, 8)
+        assert template["layers_0"]["self_attn"]["q_proj"]["kernel"].shape == (
+            8, 8)
+        assert template["layers_0"]["self_attn"]["o_proj"]["kernel"].shape == (
+            8, 8)
         assert template["layers_0"]["mlp"]["gate"]["kernel"].shape == (8, 16)
         assert template["layers_0"]["mlp"]["down"]["kernel"].shape == (16, 8)
         assert template["final_norm"]["weight"].shape == (8, )
         assert template["lm_head"]["weight"].shape == (32, 8)
+
+    def test_build_modlax_llama_restore_template_with_named_adapter(self):
+        devices = jax.local_devices()
+        mesh = Mesh(np.array(devices[:1]), axis_names=("model", ))
+        checkpoint_config = {
+            "dtype": "float32",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "tie_word_embeddings": True,
+            "num_routing_experts": None,
+            "adapters": [{
+                "name": "train_adapter",
+                "iffm": 0.5,
+            }],
+        }
+
+        template = _build_modlax_llama_restore_template(
+            checkpoint_config, mesh)
+        adapter_template = template["layers_0"]["adapters"]["train_adapter"]
+
+        assert adapter_template["attention"]["in_proj"]["kernel"].shape == (8,
+                                                                            4)
+        assert adapter_template["attention"]["out_proj"]["kernel"].shape == (4,
+                                                                             8)
+        assert adapter_template["mlp"]["in_proj"]["kernel"].shape == (8, 4)
+        assert adapter_template["mlp"]["out_proj"]["kernel"].shape == (4, 8)
 
     def test_iter_modlax_llama_hf_weights(self):
         checkpoint_config = {
@@ -166,23 +206,28 @@ class TestModlaxOrbaxLlamaSupport:
             "adapter_iffm": None,
         }
         params = {
-            "token_embed": jnp.arange(32 * 8, dtype=jnp.float32).reshape(32, 8),
+            "token_embed": jnp.arange(32 * 8,
+                                      dtype=jnp.float32).reshape(32, 8),
             "layers_0": {
                 "input_layernorm": {
                     "weight": jnp.ones((8, ), dtype=jnp.float32),
                 },
                 "self_attn": {
                     "q_proj": {
-                        "kernel": jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
+                        "kernel":
+                        jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
                     },
                     "k_proj": {
-                        "kernel": jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
+                        "kernel":
+                        jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
                     },
                     "v_proj": {
-                        "kernel": jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
+                        "kernel":
+                        jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4),
                     },
                     "o_proj": {
-                        "kernel": jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
+                        "kernel":
+                        jnp.arange(8 * 8, dtype=jnp.float32).reshape(8, 8),
                     },
                 },
                 "post_attention_layernorm": {
@@ -190,13 +235,16 @@ class TestModlaxOrbaxLlamaSupport:
                 },
                 "mlp": {
                     "gate": {
-                        "kernel": jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
+                        "kernel":
+                        jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
                     },
                     "up": {
-                        "kernel": jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
+                        "kernel":
+                        jnp.arange(8 * 16, dtype=jnp.float32).reshape(8, 16),
                     },
                     "down": {
-                        "kernel": jnp.arange(16 * 8, dtype=jnp.float32).reshape(16, 8),
+                        "kernel":
+                        jnp.arange(16 * 8, dtype=jnp.float32).reshape(16, 8),
                     },
                 },
             },
@@ -208,7 +256,8 @@ class TestModlaxOrbaxLlamaSupport:
             },
         }
 
-        hf_weights = dict(_iter_modlax_llama_hf_weights(params, checkpoint_config))
+        hf_weights = dict(
+            _iter_modlax_llama_hf_weights(params, checkpoint_config))
         assert "model.embed_tokens.weight" in hf_weights
         assert "model.layers.0.self_attn.q_proj.weight" in hf_weights
         assert "model.layers.0.self_attn.o_proj.weight" in hf_weights
@@ -225,6 +274,184 @@ class TestModlaxOrbaxLlamaSupport:
             np.asarray(params["layers_0"]["self_attn"]["o_proj"]["kernel"].T),
         )
 
+    def test_iter_modlax_llama_hf_weights_with_named_adapter(self):
+        checkpoint_config = {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "tie_word_embeddings": True,
+            "adapters": [{
+                "name": "train_adapter",
+                "iffm": 0.5,
+            }],
+        }
+        attention_in = jnp.arange(8 * 4, dtype=jnp.float32).reshape(8, 4)
+        attention_out = jnp.arange(4 * 8, dtype=jnp.float32).reshape(4, 8)
+        mlp_in = jnp.ones((8, 4), dtype=jnp.float32)
+        mlp_out = jnp.ones((4, 8), dtype=jnp.float32) * 2
+        params = {
+            "token_embed": jnp.zeros((32, 8), dtype=jnp.float32),
+            "layers_0": {
+                "input_layernorm": {
+                    "weight": jnp.ones((8, ), dtype=jnp.float32),
+                },
+                "self_attn": {
+                    "q_proj": {
+                        "kernel": jnp.zeros((8, 8), dtype=jnp.float32),
+                    },
+                    "k_proj": {
+                        "kernel": jnp.zeros((8, 4), dtype=jnp.float32),
+                    },
+                    "v_proj": {
+                        "kernel": jnp.zeros((8, 4), dtype=jnp.float32),
+                    },
+                    "o_proj": {
+                        "kernel": jnp.zeros((8, 8), dtype=jnp.float32),
+                    },
+                },
+                "post_attention_layernorm": {
+                    "weight": jnp.ones((8, ), dtype=jnp.float32),
+                },
+                "mlp": {
+                    "gate": {
+                        "kernel": jnp.zeros((8, 16), dtype=jnp.float32),
+                    },
+                    "up": {
+                        "kernel": jnp.zeros((8, 16), dtype=jnp.float32),
+                    },
+                    "down": {
+                        "kernel": jnp.zeros((16, 8), dtype=jnp.float32),
+                    },
+                },
+                "adapters": {
+                    "train_adapter": {
+                        "attention": {
+                            "in_proj": {
+                                "kernel": attention_in,
+                            },
+                            "out_proj": {
+                                "kernel": attention_out,
+                            },
+                        },
+                        "mlp": {
+                            "in_proj": {
+                                "kernel": mlp_in,
+                            },
+                            "out_proj": {
+                                "kernel": mlp_out,
+                            },
+                        },
+                    },
+                },
+            },
+            "final_norm": {
+                "weight": jnp.ones((8, ), dtype=jnp.float32),
+            },
+        }
+
+        hf_weights = dict(
+            _iter_modlax_llama_hf_weights(params, checkpoint_config))
+
+        np.testing.assert_allclose(
+            np.asarray(
+                hf_weights["model.layers.0.attn_adapter.in_proj.weight"]),
+            np.asarray(attention_in),
+        )
+        np.testing.assert_allclose(
+            np.asarray(
+                hf_weights["model.layers.0.attn_adapter.out_proj.weight"]),
+            np.asarray(attention_out),
+        )
+        np.testing.assert_allclose(
+            np.asarray(
+                hf_weights["model.layers.0.mlp_adapter.in_proj.weight"]),
+            np.asarray(mlp_in),
+        )
+        np.testing.assert_allclose(
+            np.asarray(
+                hf_weights["model.layers.0.mlp_adapter.out_proj.weight"]),
+            np.asarray(mlp_out),
+        )
+
+    def test_adapter_only_orbax_checkpoint_resolves_and_restores(self):
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError:
+            pytest.skip("orbax.checkpoint is not installed")
+
+        devices = jax.local_devices()
+        mesh = Mesh(np.array(devices[:1]), axis_names=("model", ))
+        adapter_config = {"name": "unit_adapter", "iffm": 0.5}
+        attention_in = jnp.arange(4 * 2, dtype=jnp.float32).reshape(4, 2)
+        adapter_params = {
+            "layers_0": {
+                "adapters": {
+                    "unit_adapter": {
+                        "attention": {
+                            "in_proj": {
+                                "kernel": attention_in,
+                            },
+                            "out_proj": {
+                                "kernel": jnp.ones((2, 4), dtype=jnp.float32),
+                            },
+                        },
+                        "mlp": {
+                            "in_proj": {
+                                "kernel": jnp.ones(
+                                    (4, 2), dtype=jnp.float32) * 2,
+                            },
+                            "out_proj": {
+                                "kernel": jnp.ones(
+                                    (2, 4), dtype=jnp.float32) * 3,
+                            },
+                        },
+                    },
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            checkpoint_path = os.path.join(checkpoint_dir, "adapter")
+            with ocp.StandardCheckpointer() as checkpointer:
+                checkpointer.save(checkpoint_path, adapter_params, force=True)
+                wait = getattr(checkpointer, "wait_until_finished", None)
+                if callable(wait):
+                    wait()
+            with open(os.path.join(checkpoint_path, "adapter_config.yml"),
+                      "w",
+                      encoding="utf-8") as f:
+                f.write("name: unit_adapter\niffm: 0.5\n")
+
+            assert _is_modlax_adapter_orbax_checkpoint(checkpoint_path)
+            assert _resolve_modlax_adapter_orbax_checkpoint_path(
+                checkpoint_path) == checkpoint_path
+            assert _load_modlax_adapter_checkpoint_config(
+                checkpoint_path) == adapter_config
+
+            vllm_config = MagicMock()
+            vllm_config.model_config.hf_config.hidden_size = 4
+            vllm_config.model_config.hf_config.num_hidden_layers = 1
+            vllm_config.model_config.dtype = jnp.float32
+            template = _build_modlax_llama_adapter_restore_template(
+                vllm_config, adapter_config, mesh)
+            with ocp.StandardCheckpointer() as checkpointer:
+                restored = checkpointer.restore(checkpoint_path,
+                                                target=template)
+
+            hf_weights = dict(
+                _iter_modlax_llama_adapter_hf_weights(restored,
+                                                      adapter_config,
+                                                      num_layers=1))
+            np.testing.assert_allclose(
+                np.asarray(
+                    hf_weights["model.layers.0.attn_adapter.in_proj.weight"]),
+                np.asarray(attention_in),
+            )
+
     def test_modlax_path_takes_priority_over_runai_iterator(self):
         devices = np.array(jax.local_devices()[:1])
         mesh = Mesh(devices, axis_names=("model", ))
@@ -232,22 +459,23 @@ class TestModlaxOrbaxLlamaSupport:
 
         vllm_config = MagicMock()
         vllm_config.model_config.model = "unused-model-path"
-        vllm_config.model_config.runai_model_weights_iterator = [
-            ("unused.key", torch.ones((1, )))
-        ]
+        vllm_config.model_config.runai_model_weights_iterator = [("unused.key",
+                                                                  torch.ones(
+                                                                      (1, )))]
         vllm_config.model_config.hf_config.architectures = ["LlamaForCausalLM"]
         vllm_config.load_config.download_dir = None
         vllm_config.speculative_config = None
 
         with patch(
                 "tpu_inference.models.jax.utils.weight_utils._select_modlax_orbax_checkpoint_path",
-                return_value="gs://dummy-orbax-checkpoint"), patch(
-                    "tpu_inference.models.jax.utils.weight_utils._load_modlax_orbax_llama_weights"
-                ) as modlax_loader, patch(
-                    "tpu_inference.models.jax.utils.weight_utils._load_and_shard_weight",
-                    side_effect=AssertionError(
-                        "RunAI iterator path should not be used for Modlax Orbax checkpoints."
-                    )):
+                return_value="gs://dummy-orbax-checkpoint"
+        ), patch(
+                "tpu_inference.models.jax.utils.weight_utils._load_modlax_orbax_llama_weights"
+        ) as modlax_loader, patch(
+                "tpu_inference.models.jax.utils.weight_utils._load_and_shard_weight",
+                side_effect=AssertionError(
+                    "RunAI iterator path should not be used for Modlax Orbax checkpoints."
+                )):
             load_hf_weights(vllm_config=vllm_config,
                             model=model,
                             metadata_map=MetadataMap(),
@@ -256,7 +484,8 @@ class TestModlaxOrbaxLlamaSupport:
         modlax_loader.assert_called_once()
 
     @patch("google.cloud.storage.Client")
-    def test_is_modlax_orbax_checkpoint_gcs_fallback(self, mock_storage_client):
+    def test_is_modlax_orbax_checkpoint_gcs_fallback(self,
+                                                     mock_storage_client):
         mock_bucket = MagicMock()
         mock_client = MagicMock()
         mock_client.bucket.return_value = mock_bucket

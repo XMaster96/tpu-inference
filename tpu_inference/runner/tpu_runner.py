@@ -65,8 +65,8 @@ from tpu_inference.models.common.model_loader import get_model
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
 from tpu_inference.models.jax.utils.weight_utils import (
-    _is_modlax_orbax_checkpoint, _load_modlax_orbax_checkpoint_config,
-    shard_put, transfer_state_with_mappings)
+    _classify_modlax_orbax_checkpoint, _load_modlax_orbax_checkpoint_config,
+    get_single_modlax_adapter_config, shard_put, transfer_state_with_mappings)
 from tpu_inference.runner import utils as runner_utils
 from tpu_inference.runner.compilation_manager import CompilationManager
 from tpu_inference.runner.input_batch import CachedRequestState, InputBatch
@@ -93,47 +93,47 @@ MIN_NUM_SEQS = 8
 
 
 def _summarize_scheduler_output_for_empty_cycle(
-    scheduler_output: "VllmSchedulerOutput",
-) -> dict[str, object]:
+    scheduler_output: "VllmSchedulerOutput", ) -> dict[str, object]:
     cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
     cached_req_ids = list(getattr(cached_reqs, "req_ids", []) or [])
     resumed_req_ids = sorted(
-        str(req_id) for req_id in (getattr(cached_reqs, "resumed_req_ids", set()) or set())
-    )
+        str(req_id) for req_id in (
+            getattr(cached_reqs, "resumed_req_ids", set()) or set()))
     return {
         "scheduled_new_req_ids": [
-            str(getattr(req, "req_id", "<unknown>"))
-            for req in (getattr(scheduler_output, "scheduled_new_reqs", None) or [])
+            str(getattr(req, "req_id", "<unknown>")) for req in (
+                getattr(scheduler_output, "scheduled_new_reqs", None) or [])
         ],
-        "scheduled_cached_req_ids": cached_req_ids,
-        "scheduled_cached_resumed_req_ids": resumed_req_ids,
-        "num_scheduled_tokens": dict(
-            getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
-        ),
-        "finished_req_ids": sorted(
-            str(req_id)
-            for req_id in (getattr(scheduler_output, "finished_req_ids", set()) or set())
-        ),
-        "preempted_req_ids": sorted(
-            str(req_id)
-            for req_id in (getattr(scheduler_output, "preempted_req_ids", set()) or set())
-        ),
-        "has_structured_output_requests": bool(
-            getattr(scheduler_output, "has_structured_output_requests", False)
-        ),
-        "pending_structured_output_tokens": bool(
-            getattr(scheduler_output, "pending_structured_output_tokens", False)
-        ),
-        "scheduled_spec_decode_req_ids": sorted(
-            str(req_id)
-            for req_id in (
-                getattr(scheduler_output, "scheduled_spec_decode_tokens", {}) or {}
-            ).keys()
-        ),
-        "tpu_scheduler_state_snapshot": getattr(
-            scheduler_output, "_tpu_scheduler_state_snapshot", None),
-        "tpu_last_live_reload_recovery": getattr(
-            scheduler_output, "_tpu_last_live_reload_recovery", None),
+        "scheduled_cached_req_ids":
+        cached_req_ids,
+        "scheduled_cached_resumed_req_ids":
+        resumed_req_ids,
+        "num_scheduled_tokens":
+        dict(getattr(scheduler_output, "num_scheduled_tokens", {}) or {}),
+        "finished_req_ids":
+        sorted(
+            str(req_id) for req_id in
+            (getattr(scheduler_output, "finished_req_ids", set()) or set())),
+        "preempted_req_ids":
+        sorted(
+            str(req_id) for req_id in
+            (getattr(scheduler_output, "preempted_req_ids", set()) or set())),
+        "has_structured_output_requests":
+        bool(getattr(scheduler_output, "has_structured_output_requests",
+                     False)),
+        "pending_structured_output_tokens":
+        bool(
+            getattr(scheduler_output, "pending_structured_output_tokens",
+                    False)),
+        "scheduled_spec_decode_req_ids":
+        sorted(
+            str(req_id) for req_id in (
+                getattr(scheduler_output, "scheduled_spec_decode_tokens", {})
+                or {}).keys()),
+        "tpu_scheduler_state_snapshot":
+        getattr(scheduler_output, "_tpu_scheduler_state_snapshot", None),
+        "tpu_last_live_reload_recovery":
+        getattr(scheduler_output, "_tpu_last_live_reload_recovery", None),
     }
 
 
@@ -775,9 +775,9 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 details = _summarize_scheduler_output_for_empty_cycle(
                     scheduler_output)
                 if getattr(
-                    scheduler_output,
-                    "_tpu_last_live_reload_recovery",
-                    None,
+                        scheduler_output,
+                        "_tpu_last_live_reload_recovery",
+                        None,
                 ) is not None:
                     logger.error(
                         "TPU runner received empty scheduler output after "
@@ -1819,23 +1819,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                              or model_config.model)
         if not target_checkpoint:
             raise ValueError("No checkpoint path was provided for reload.")
-        if not _is_modlax_orbax_checkpoint(target_checkpoint):
+        checkpoint_kind = _classify_modlax_orbax_checkpoint(target_checkpoint)
+        if checkpoint_kind is None:
             raise FileNotFoundError(
                 "Modlax Orbax checkpoint markers were not found at "
                 f"{target_checkpoint!r}.")
+        adapter_only_reload = checkpoint_kind == "adapter_only"
+        checkpoint_has_adapter = False
 
         # Enforce strict architecture compatibility for live reload.
         # Cross-architecture swaps (e.g. 12B <-> 24B) are intentionally
         # unsupported.
-        self._assert_reload_checkpoint_compatible(target_checkpoint)
+        if not adapter_only_reload:
+            checkpoint_cfg = _load_modlax_orbax_checkpoint_config(
+                target_checkpoint)
+            checkpoint_has_adapter = get_single_modlax_adapter_config(
+                checkpoint_cfg.get("adapters"),
+                "reload checkpoint adapters",
+            ) is not None
+            self._assert_reload_checkpoint_compatible(target_checkpoint)
 
-        if not isinstance(self.model_fn, functools.partial) or not self.model_fn.args:
+        if not isinstance(self.model_fn,
+                          functools.partial) or not self.model_fn.args:
             raise RuntimeError(
                 "Live weight reload currently requires MODEL_IMPL_TYPE=flax_nnx."
             )
 
         # Route subsequent loader calls to the new checkpoint.
-        model_config.model_weights = target_checkpoint
+        if not adapter_only_reload:
+            model_config.model_weights = target_checkpoint
 
         had_kv_cache = bool(self.kv_caches)
         release_elapsed_s = 0.0
@@ -1853,10 +1865,18 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         else:
             released_entries = 0
 
-        release_state_start = time.perf_counter()
-        released_state_entries = self._release_model_state_for_reload()
-        release_state_elapsed_s = time.perf_counter() - release_state_start
-        hbm_after_state_release = self._get_reload_hbm_stats()
+        preserved_adapter_state = {}
+        if not adapter_only_reload and not checkpoint_has_adapter:
+            preserved_adapter_state = self._snapshot_adapter_state_for_reload()
+
+        if adapter_only_reload:
+            released_state_entries = 0
+            hbm_after_state_release = hbm_after_release
+        else:
+            release_state_start = time.perf_counter()
+            released_state_entries = self._release_model_state_for_reload()
+            release_state_elapsed_s = time.perf_counter() - release_state_start
+            hbm_after_state_release = self._get_reload_hbm_stats()
 
         # Re-merge graphdef + state, run model-specific load_weights(), then
         # extract the updated state back. This keeps all compiled call-sites.
@@ -1867,9 +1887,23 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         rebuild_error: Exception | None = None
         try:
             load_start = time.perf_counter()
-            model.load_weights(self.rng_key)
+            if adapter_only_reload:
+                load_adapter_weights = getattr(model, "load_adapter_weights",
+                                               None)
+                if not callable(load_adapter_weights):
+                    raise RuntimeError(
+                        f"{type(model).__name__} does not support adapter-only reload."
+                    )
+                load_adapter_weights(target_checkpoint)
+            else:
+                model.load_weights(self.rng_key)
             load_elapsed_s = time.perf_counter() - load_start
-            self.state = nnx.state(model)
+            loaded_state = nnx.state(model)
+            if preserved_adapter_state:
+                self._restore_adapter_state_snapshot(loaded_state,
+                                                     preserved_adapter_state)
+                nnx.update(model, loaded_state)
+            self.state = loaded_state
             gc.collect()
             hbm_after_load = self._get_reload_hbm_stats()
         except Exception as exc:  # noqa: BLE001
@@ -1897,9 +1931,15 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             raise load_error
 
         return {
-            "status": "ok",
-            "checkpoint_path": target_checkpoint,
-            "reload_mode": "kv_and_state" if release_kv_cache else "state_only",
+            "status":
+            "ok",
+            "checkpoint_path":
+            target_checkpoint,
+            "checkpoint_kind":
+            checkpoint_kind,
+            "reload_mode":
+            ("adapter_only" if adapter_only_reload else
+             ("kv_and_state" if release_kv_cache else "state_only")),
             "timing_s": {
                 "release_kv_cache": round(release_elapsed_s, 4),
                 "release_state": round(release_state_elapsed_s, 4),
@@ -1907,15 +1947,51 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 "rebuild_kv_cache": round(rebuild_elapsed_s, 4),
                 "total": round(total_elapsed_s, 4),
             },
-            "hbm_before": hbm_before,
-            "hbm_after_release": hbm_after_release,
-            "hbm_after_state_release": hbm_after_state_release,
-            "hbm_after_load": hbm_after_load,
-            "hbm_after": hbm_after,
-            "kv_cache_entries": len(self.kv_caches),
-            "released_kv_cache_entries": released_entries,
-            "released_state_entries": released_state_entries,
+            "hbm_before":
+            hbm_before,
+            "hbm_after_release":
+            hbm_after_release,
+            "hbm_after_state_release":
+            hbm_after_state_release,
+            "hbm_after_load":
+            hbm_after_load,
+            "hbm_after":
+            hbm_after,
+            "kv_cache_entries":
+            len(self.kv_caches),
+            "released_kv_cache_entries":
+            released_entries,
+            "released_state_entries":
+            released_state_entries,
         }
+
+    def _snapshot_adapter_state_for_reload(
+            self) -> dict[tuple[object, ...], jax.Array]:
+        if not hasattr(self.state, "flat_state"):
+            return {}
+        snapshot: dict[tuple[object, ...], jax.Array] = {}
+        for path, leaf in self.state.flat_state():
+            if not any(
+                    str(part) in ("attn_adapter", "mlp_adapter")
+                    for part in path):
+                continue
+            value = getattr(leaf, "value", leaf)
+            if isinstance(value, jax.ShapeDtypeStruct):
+                continue
+            snapshot[tuple(path)] = jnp.copy(value)
+        return snapshot
+
+    def _restore_adapter_state_snapshot(
+        self,
+        state: nnx.State,
+        snapshot: dict[tuple[object, ...], jax.Array],
+    ) -> None:
+        for path, value in snapshot.items():
+            leaf = state
+            for part in path:
+                leaf = leaf[part]
+            if hasattr(leaf, "value"):
+                leaf.value = value
 
     def _get_reload_hbm_stats(self) -> dict[str, float]:
         usage = common_utils.hbm_usage_bytes(self.devices)
@@ -1924,10 +2000,12 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return {
             "used_gib": round(total_used / common_utils.GBYTES, 3),
             "limit_gib": round(total_limit / common_utils.GBYTES, 3),
-            "free_gib": round((total_limit - total_used) / common_utils.GBYTES, 3),
+            "free_gib": round((total_limit - total_used) / common_utils.GBYTES,
+                              3),
         }
 
-    def _assert_reload_checkpoint_compatible(self, checkpoint_path: str) -> None:
+    def _assert_reload_checkpoint_compatible(self,
+                                             checkpoint_path: str) -> None:
         checkpoint_cfg = _load_modlax_orbax_checkpoint_config(checkpoint_path)
         hf_cfg = self.model_config.hf_config
 
@@ -1939,16 +2017,24 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 model_head_dim = int(hidden_size) // int(num_attention_heads)
 
         expected: dict[str, int | bool | None] = {
-            "hidden_size": getattr(hf_cfg, "hidden_size", None),
-            "intermediate_size": getattr(hf_cfg, "intermediate_size", None),
-            "num_hidden_layers": getattr(hf_cfg, "num_hidden_layers", None),
-            "num_attention_heads": getattr(hf_cfg, "num_attention_heads", None),
-            "num_key_value_heads": getattr(hf_cfg, "num_key_value_heads", None),
-            "head_dim": model_head_dim,
-            "vocab_size": getattr(hf_cfg, "vocab_size", None),
-            "tie_word_embeddings": getattr(hf_cfg, "tie_word_embeddings", None),
-            "max_position_embeddings": getattr(hf_cfg,
-                                               "max_position_embeddings", None),
+            "hidden_size":
+            getattr(hf_cfg, "hidden_size", None),
+            "intermediate_size":
+            getattr(hf_cfg, "intermediate_size", None),
+            "num_hidden_layers":
+            getattr(hf_cfg, "num_hidden_layers", None),
+            "num_attention_heads":
+            getattr(hf_cfg, "num_attention_heads", None),
+            "num_key_value_heads":
+            getattr(hf_cfg, "num_key_value_heads", None),
+            "head_dim":
+            model_head_dim,
+            "vocab_size":
+            getattr(hf_cfg, "vocab_size", None),
+            "tie_word_embeddings":
+            getattr(hf_cfg, "tie_word_embeddings", None),
+            "max_position_embeddings":
+            getattr(hf_cfg, "max_position_embeddings", None),
         }
 
         for key, expected_value in expected.items():
@@ -1962,11 +2048,13 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
             if isinstance(expected_value, bool):
                 assert bool(checkpoint_value) == expected_value, (
                     "Checkpoint architecture mismatch for "
-                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}")
+                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}"
+                )
             else:
                 assert int(checkpoint_value) == int(expected_value), (
                     "Checkpoint architecture mismatch for "
-                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}")
+                    f"{key}: running={expected_value}, checkpoint={checkpoint_value}"
+                )
 
     def _release_kv_cache_for_reload(self) -> int:
         released_entries = len(self.kv_caches)
@@ -1981,7 +2069,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         return released_entries
 
     def _rebuild_kv_cache_after_reload(self) -> None:
-        if not hasattr(self, "kv_cache_config") or self.kv_cache_config is None:
+        if not hasattr(self,
+                       "kv_cache_config") or self.kv_cache_config is None:
             return
         self.initialize_kv_cache(self.kv_cache_config,
                                  getattr(self, "topology_order_id", 0))

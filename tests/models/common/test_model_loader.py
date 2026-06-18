@@ -132,24 +132,23 @@ def test_override_hf_config_from_modlax_orbax(vllm_config):
         with open(os.path.join(checkpoint_path, "model_config.yml"),
                   "w",
                   encoding="utf-8") as f:
-            f.write(
-                "\n".join([
-                    "dtype: bfloat16",
-                    "head_dim: 128",
-                    "hidden_act: silu",
-                    "hidden_size: 5120",
-                    "intermediate_size: 32768",
-                    "max_position_embeddings: 32768",
-                    "num_attention_heads: 32",
-                    "num_hidden_layers: 40",
-                    "num_key_value_heads: 16",
-                    "rope_scaling: 1.0",
-                    "rope_theta: 100000000.0",
-                    "tie_word_embeddings: false",
-                    "attention_bias: false",
-                    "mlp_bias: false",
-                    "vocab_size: 131072",
-                ]))
+            f.write("\n".join([
+                "dtype: bfloat16",
+                "head_dim: 128",
+                "hidden_act: silu",
+                "hidden_size: 5120",
+                "intermediate_size: 32768",
+                "max_position_embeddings: 32768",
+                "num_attention_heads: 32",
+                "num_hidden_layers: 40",
+                "num_key_value_heads: 16",
+                "rope_scaling: 1.0",
+                "rope_theta: 100000000.0",
+                "tie_word_embeddings: false",
+                "attention_bias: false",
+                "mlp_bias: false",
+                "vocab_size: 131072",
+            ]))
 
         # Start with a non-Llama config, then verify override.
         vllm_config.model_config.model_weights = checkpoint_path
@@ -157,8 +156,8 @@ def test_override_hf_config_from_modlax_orbax(vllm_config):
             "LlamaForCausalLM"
         ]
 
-        model_loader._maybe_override_hf_config_with_modlax_orbax(vllm_config,
-                                                                  False)
+        model_loader._maybe_override_hf_config_with_modlax_orbax(
+            vllm_config, False)
         hf_config = vllm_config.model_config.hf_config
         assert hf_config.architectures == ["LlamaForCausalLM"]
         assert hf_config.hidden_size == 5120
@@ -173,6 +172,94 @@ def test_override_hf_config_from_modlax_orbax(vllm_config):
         assert hf_config.tie_word_embeddings is False
 
 
+def test_override_hf_config_from_modlax_orbax_preserves_adapter(vllm_config):
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        with open(os.path.join(checkpoint_path, "_CHECKPOINT_METADATA"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(checkpoint_path, "model_config.yml"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("\n".join([
+                "dtype: bfloat16",
+                "head_dim: 4",
+                "hidden_act: silu",
+                "hidden_size: 8",
+                "intermediate_size: 16",
+                "max_position_embeddings: 128",
+                "num_attention_heads: 2",
+                "num_hidden_layers: 1",
+                "num_key_value_heads: 1",
+                "rope_scaling: 1.0",
+                "rope_theta: 10000.0",
+                "tie_word_embeddings: true",
+                "attention_bias: false",
+                "mlp_bias: false",
+                "vocab_size: 32",
+                "adapters:",
+                "  - name: train_adapter",
+                "    iffm: 0.5",
+            ]))
+
+        vllm_config.model_config.model_weights = checkpoint_path
+        model_loader._maybe_override_hf_config_with_modlax_orbax(
+            vllm_config, False)
+
+        assert vllm_config.model_config.hf_config.adapters == [{
+            "name": "train_adapter",
+            "iffm": 0.5,
+        }]
+
+
+def test_override_hf_config_from_modlax_orbax_adds_runtime_adapter(
+        vllm_config):
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        checkpoint_path = os.path.join(checkpoint_dir, "ckpt")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        with open(os.path.join(checkpoint_path, "_CHECKPOINT_METADATA"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("{}")
+        with open(os.path.join(checkpoint_path, "model_config.yml"),
+                  "w",
+                  encoding="utf-8") as f:
+            f.write("\n".join([
+                "dtype: bfloat16",
+                "head_dim: 4",
+                "hidden_act: silu",
+                "hidden_size: 8",
+                "intermediate_size: 16",
+                "max_position_embeddings: 128",
+                "num_attention_heads: 2",
+                "num_hidden_layers: 1",
+                "num_key_value_heads: 1",
+                "rope_scaling: 1.0",
+                "rope_theta: 10000.0",
+                "tie_word_embeddings: true",
+                "attention_bias: false",
+                "mlp_bias: false",
+                "vocab_size: 32",
+            ]))
+
+        vllm_config.model_config.model_weights = checkpoint_path
+        vllm_config.model_config.hf_overrides = {
+            "adapters": [{
+                "name": "fresh_adapter",
+                "iffm": 0.25,
+            }]
+        }
+        model_loader._maybe_override_hf_config_with_modlax_orbax(
+            vllm_config, False)
+
+        assert vllm_config.model_config.hf_config.adapters == [{
+            "name": "fresh_adapter",
+            "iffm": 0.25,
+        }]
+
+
 def test_override_hf_config_from_modlax_orbax_preserves_yarn_scaling(
         vllm_config):
     with tempfile.TemporaryDirectory() as checkpoint_dir:
@@ -185,37 +272,36 @@ def test_override_hf_config_from_modlax_orbax_preserves_yarn_scaling(
         with open(os.path.join(checkpoint_path, "model_config.yml"),
                   "w",
                   encoding="utf-8") as f:
-            f.write(
-                "\n".join([
-                    "dtype: bfloat16",
-                    "head_dim: 128",
-                    "hidden_act: silu",
-                    "hidden_size: 5120",
-                    "intermediate_size: 16384",
-                    "max_position_embeddings: 262144",
-                    "num_attention_heads: 32",
-                    "num_hidden_layers: 40",
-                    "num_key_value_heads: 8",
-                    "rope_theta: 1000000000.0",
-                    "rope_type: yarn",
-                    "rope_yarn_config:",
-                    "  factor: 16.0",
-                    "  original_max_position_embeddings: 16384.0",
-                    "  beta_fast: 32.0",
-                    "  beta_slow: 1.0",
-                    "  attention_factor: 1.25",
-                    "  mscale: 1.0",
-                    "  mscale_all_dim: 1.0",
-                    "  llama_4_scaling_beta: 0.1",
-                    "tie_word_embeddings: false",
-                    "attention_bias: false",
-                    "mlp_bias: false",
-                    "vocab_size: 131072",
-                ]))
+            f.write("\n".join([
+                "dtype: bfloat16",
+                "head_dim: 128",
+                "hidden_act: silu",
+                "hidden_size: 5120",
+                "intermediate_size: 16384",
+                "max_position_embeddings: 262144",
+                "num_attention_heads: 32",
+                "num_hidden_layers: 40",
+                "num_key_value_heads: 8",
+                "rope_theta: 1000000000.0",
+                "rope_type: yarn",
+                "rope_yarn_config:",
+                "  factor: 16.0",
+                "  original_max_position_embeddings: 16384.0",
+                "  beta_fast: 32.0",
+                "  beta_slow: 1.0",
+                "  attention_factor: 1.25",
+                "  mscale: 1.0",
+                "  mscale_all_dim: 1.0",
+                "  llama_4_scaling_beta: 0.1",
+                "tie_word_embeddings: false",
+                "attention_bias: false",
+                "mlp_bias: false",
+                "vocab_size: 131072",
+            ]))
 
         vllm_config.model_config.model_weights = checkpoint_path
-        model_loader._maybe_override_hf_config_with_modlax_orbax(vllm_config,
-                                                                  False)
+        model_loader._maybe_override_hf_config_with_modlax_orbax(
+            vllm_config, False)
         hf_config = vllm_config.model_config.hf_config
 
         assert hf_config.rope_scaling is not None

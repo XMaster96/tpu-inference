@@ -62,6 +62,99 @@ _MODLAX_ROUTING_FLAGS = (
     "use_norm_routing_experts",
 )
 
+_MODLAX_ADAPTER_CONFIG_FILENAMES = ("adapter_config.yml",
+                                    "adapter_config.yaml")
+_MODLAX_ADAPTER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+
+
+def _normalize_modlax_adapter_config(adapter_config: Any,
+                                     source: str) -> dict[str, Any]:
+    if isinstance(adapter_config, dict):
+        name = adapter_config.get("name")
+        iffm = adapter_config.get("iffm")
+    else:
+        name = getattr(adapter_config, "name", None)
+        iffm = getattr(adapter_config, "iffm", None)
+
+    if not isinstance(name, str):
+        raise ValueError(f"{source} adapter name must be a string.")
+    if not _MODLAX_ADAPTER_NAME_PATTERN.fullmatch(name):
+        raise ValueError(f"{source} adapter name {name!r} must match "
+                         f"{_MODLAX_ADAPTER_NAME_PATTERN.pattern}.")
+    try:
+        iffm_value = float(iffm)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{source} adapter iffm must be a positive number.") from exc
+    if iffm_value <= 0.0:
+        raise ValueError(f"{source} adapter iffm must be positive.")
+    return {"name": name, "iffm": iffm_value}
+
+
+def normalize_modlax_adapter_configs(adapters: Any,
+                                     source: str = "adapters"
+                                     ) -> list[dict[str, Any]]:
+    if adapters is None:
+        return []
+    if not isinstance(adapters, (list, tuple)):
+        raise ValueError(f"{source} must be a list of adapter configs.")
+
+    normalized = [
+        _normalize_modlax_adapter_config(adapter, source)
+        for adapter in adapters
+    ]
+    duplicate_names = sorted({
+        adapter["name"]
+        for adapter in normalized
+        if sum(other["name"] == adapter["name"] for other in normalized) > 1
+    })
+    if duplicate_names:
+        raise ValueError("Duplicate Modlax adapter names are not allowed: "
+                         f"{', '.join(duplicate_names)}")
+    return normalized
+
+
+def get_single_modlax_adapter_config(adapters: Any,
+                                     source: str = "adapters"
+                                     ) -> dict[str, Any] | None:
+    normalized = normalize_modlax_adapter_configs(adapters, source)
+    if len(normalized) > 1:
+        raise ValueError(
+            "The TPU online RL server supports at most one Modlax adapter; "
+            f"{source} contains {len(normalized)} adapters.")
+    return normalized[0] if normalized else None
+
+
+def modlax_adapter_configs_match(left: dict[str, Any] | None,
+                                 right: dict[str, Any] | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return left["name"] == right["name"] and math.isclose(
+        float(left["iffm"]),
+        float(right["iffm"]),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+
+
+def resolve_single_modlax_adapter_config(
+    base_adapters: Any,
+    override_adapters: Any,
+    *,
+    base_source: str = "checkpoint adapters",
+    override_source: str = "runtime adapter override",
+) -> dict[str, Any] | None:
+    base_adapter = get_single_modlax_adapter_config(base_adapters, base_source)
+    override_adapter = get_single_modlax_adapter_config(
+        override_adapters, override_source)
+    if (base_adapter is not None and override_adapter is not None and
+            not modlax_adapter_configs_match(base_adapter, override_adapter)):
+        raise ValueError(
+            "Configured Modlax adapter does not match checkpoint adapter: "
+            f"{override_source}={override_adapter}, {base_source}={base_adapter}"
+        )
+    return override_adapter or base_adapter
+
 
 def _import_orbax_checkpoint():
     try:
@@ -87,8 +180,7 @@ def _canonical_jax_dtype(dtype_name: str) -> jnp.dtype:
     if normalized not in dtype_map:
         raise ValueError(
             f"Unsupported Modlax checkpoint dtype '{dtype_name}'. "
-            f"Supported values: {sorted(dtype_map.keys())}"
-        )
+            f"Supported values: {sorted(dtype_map.keys())}")
     return dtype_map[normalized]
 
 
@@ -124,7 +216,8 @@ def _read_gcs_text(blob_uri: str, encoding: str = "utf-8") -> str:
         raise ValueError(f"Expected gs:// URI, got: {blob_uri}")
     bucket_name, object_path = parsed
     if not object_path:
-        raise ValueError(f"Expected gs:// URI with object path, got: {blob_uri}")
+        raise ValueError(
+            f"Expected gs:// URI with object path, got: {blob_uri}")
     from google.cloud import storage
 
     client = storage.Client()
@@ -183,16 +276,30 @@ def _load_yaml_dict(path: str) -> dict[str, Any]:
     try:
         import yaml
     except ImportError as exc:
-        raise ImportError("PyYAML is required to parse Modlax model_config.yml.") from exc
+        raise ImportError(
+            "PyYAML is required to parse Modlax model_config.yml.") from exc
 
     payload = yaml.safe_load(_read_text(path, encoding="utf-8")) or {}
     if not isinstance(payload, dict):
-        raise ValueError(f"Expected YAML mapping at {path}, got {type(payload).__name__}.")
+        raise ValueError(
+            f"Expected YAML mapping at {path}, got {type(payload).__name__}.")
     return payload
 
 
 def _is_modlax_orbax_checkpoint(path: str | None) -> bool:
     return _resolve_modlax_orbax_checkpoint_path(path) is not None
+
+
+def _is_modlax_adapter_orbax_checkpoint(path: str | None) -> bool:
+    return _resolve_modlax_adapter_orbax_checkpoint_path(path) is not None
+
+
+def _classify_modlax_orbax_checkpoint(path: str | None) -> str | None:
+    if _resolve_modlax_orbax_checkpoint_path(path) is not None:
+        return "full_model"
+    if _resolve_modlax_adapter_orbax_checkpoint_path(path) is not None:
+        return "adapter_only"
+    return None
 
 
 def _resolve_modlax_orbax_checkpoint_path(path: str | None) -> str | None:
@@ -207,7 +314,24 @@ def _resolve_modlax_orbax_checkpoint_path(path: str | None) -> str | None:
     return None
 
 
-def _load_modlax_orbax_checkpoint_config(checkpoint_path: str) -> dict[str, Any]:
+def _resolve_modlax_adapter_orbax_checkpoint_path(
+        path: str | None) -> str | None:
+    if not path:
+        return None
+    for candidate in _checkpoint_path_candidates(path):
+        metadata_path = _checkpoint_member_path(candidate,
+                                                "_CHECKPOINT_METADATA")
+        if not _path_exists(metadata_path):
+            continue
+        for config_filename in _MODLAX_ADAPTER_CONFIG_FILENAMES:
+            config_path = _checkpoint_member_path(candidate, config_filename)
+            if _path_exists(config_path):
+                return candidate
+    return None
+
+
+def _load_modlax_orbax_checkpoint_config(
+        checkpoint_path: str) -> dict[str, Any]:
     resolved_checkpoint_path = _resolve_modlax_orbax_checkpoint_path(
         checkpoint_path)
     if resolved_checkpoint_path is None:
@@ -219,13 +343,36 @@ def _load_modlax_orbax_checkpoint_config(checkpoint_path: str) -> dict[str, Any]
     return _load_yaml_dict(model_config_path)
 
 
+def _load_modlax_adapter_checkpoint_config(
+        checkpoint_path: str) -> dict[str, Any]:
+    resolved_checkpoint_path = _resolve_modlax_adapter_orbax_checkpoint_path(
+        checkpoint_path)
+    if resolved_checkpoint_path is None:
+        expected = ", ".join(_MODLAX_ADAPTER_CONFIG_FILENAMES)
+        raise FileNotFoundError(
+            f"Missing {expected} in Modlax adapter checkpoint path: {checkpoint_path}"
+        )
+    for config_filename in _MODLAX_ADAPTER_CONFIG_FILENAMES:
+        adapter_config_path = _checkpoint_member_path(resolved_checkpoint_path,
+                                                      config_filename)
+        if _path_exists(adapter_config_path):
+            return _normalize_modlax_adapter_config(
+                _load_yaml_dict(adapter_config_path),
+                f"adapter checkpoint config {adapter_config_path}",
+            )
+    raise AssertionError(
+        "adapter checkpoint path resolved without a config file")
+
+
 def _get_model_axis_name(mesh: Mesh) -> str:
     if "model" in mesh.axis_names:
         return "model"
     if "tp" in mesh.axis_names:
         return "tp"
     if not mesh.axis_names:
-        raise ValueError("Mesh has no axis names; cannot shard Modlax checkpoint restore template.")
+        raise ValueError(
+            "Mesh has no axis names; cannot shard Modlax checkpoint restore template."
+        )
     return str(mesh.axis_names[-1])
 
 
@@ -234,7 +381,8 @@ def _build_modlax_llama_restore_template(
     mesh: Mesh,
 ) -> dict[str, Any]:
     model_axis = _get_model_axis_name(mesh)
-    param_dtype = _canonical_jax_dtype(str(checkpoint_config.get("dtype", "bfloat16")))
+    param_dtype = _canonical_jax_dtype(
+        str(checkpoint_config.get("dtype", "bfloat16")))
 
     hidden_size = int(checkpoint_config["hidden_size"])
     intermediate_size = int(checkpoint_config["intermediate_size"])
@@ -243,19 +391,24 @@ def _build_modlax_llama_restore_template(
     num_key_value_heads = int(checkpoint_config["num_key_value_heads"])
     head_dim = int(checkpoint_config["head_dim"])
     vocab_size = int(checkpoint_config["vocab_size"])
-    tie_word_embeddings = bool(checkpoint_config.get("tie_word_embeddings", True))
+    tie_word_embeddings = bool(
+        checkpoint_config.get("tie_word_embeddings", True))
     num_routing_experts = checkpoint_config.get("num_routing_experts")
     uses_routing = bool(num_routing_experts) or any(
-        bool(checkpoint_config.get(flag, False)) for flag in _MODLAX_ROUTING_FLAGS)
+        bool(checkpoint_config.get(flag, False))
+        for flag in _MODLAX_ROUTING_FLAGS)
     if uses_routing:
         raise NotImplementedError(
             "Modlax Orbax loading currently supports non-routing Llama checkpoints only."
         )
 
-    adapter_iffm = checkpoint_config.get("adapter_iffm")
+    adapter_config = get_single_modlax_adapter_config(
+        checkpoint_config.get("adapters"),
+        "Modlax checkpoint adapters",
+    )
     adapter_hidden_size = None
-    if adapter_iffm is not None:
-        adapter_hidden_size = int(float(adapter_iffm) * hidden_size)
+    if adapter_config is not None:
+        adapter_hidden_size = int(float(adapter_config["iffm"]) * hidden_size)
 
     def _leaf(shape: tuple[int, ...], spec: P) -> jax.ShapeDtypeStruct:
         return jax.ShapeDtypeStruct(
@@ -276,58 +429,84 @@ def _build_modlax_llama_restore_template(
     kv_size = num_key_value_heads * head_dim
     for layer_index in range(num_layers):
         layer_key = f"layers_{layer_index}"
-        layer_entry: dict[str, Any] = {
-            "input_layernorm": {
-                "weight": _leaf((hidden_size, ), P(None)),
-            },
-            "self_attn": {
-                "q_proj": {
-                    "kernel": _leaf((hidden_size, q_size), P(None, model_axis)),
-                },
-                "k_proj": {
-                    "kernel": _leaf((hidden_size, kv_size), P(None, model_axis)),
-                },
-                "v_proj": {
-                    "kernel": _leaf((hidden_size, kv_size), P(None, model_axis)),
-                },
-                "o_proj": {
-                    "kernel": _leaf((q_size, hidden_size), P(model_axis, None)),
-                },
-            },
-            "post_attention_layernorm": {
-                "weight": _leaf((hidden_size, ), P(None)),
-            },
-            "mlp": {
-                "gate": {
-                    "kernel": _leaf((hidden_size, intermediate_size), P(None, model_axis)),
-                },
-                "up": {
-                    "kernel": _leaf((hidden_size, intermediate_size), P(None, model_axis)),
-                },
-                "down": {
-                    "kernel": _leaf((intermediate_size, hidden_size), P(model_axis, None)),
-                },
-            },
-        }
+        layer_entry: dict[str,
+                          Any] = {
+                              "input_layernorm": {
+                                  "weight": _leaf((hidden_size, ), P(None)),
+                              },
+                              "self_attn": {
+                                  "q_proj": {
+                                      "kernel":
+                                      _leaf((hidden_size, q_size),
+                                            P(None, model_axis)),
+                                  },
+                                  "k_proj": {
+                                      "kernel":
+                                      _leaf((hidden_size, kv_size),
+                                            P(None, model_axis)),
+                                  },
+                                  "v_proj": {
+                                      "kernel":
+                                      _leaf((hidden_size, kv_size),
+                                            P(None, model_axis)),
+                                  },
+                                  "o_proj": {
+                                      "kernel":
+                                      _leaf((q_size, hidden_size),
+                                            P(model_axis, None)),
+                                  },
+                              },
+                              "post_attention_layernorm": {
+                                  "weight": _leaf((hidden_size, ), P(None)),
+                              },
+                              "mlp": {
+                                  "gate": {
+                                      "kernel":
+                                      _leaf((hidden_size, intermediate_size),
+                                            P(None, model_axis)),
+                                  },
+                                  "up": {
+                                      "kernel":
+                                      _leaf((hidden_size, intermediate_size),
+                                            P(None, model_axis)),
+                                  },
+                                  "down": {
+                                      "kernel":
+                                      _leaf((intermediate_size, hidden_size),
+                                            P(model_axis, None)),
+                                  },
+                              },
+                          }
 
-        if adapter_hidden_size is not None:
-            layer_entry["adapter"] = {
-                "attention": {
-                    "in_proj": {
-                        "kernel": _leaf((hidden_size, adapter_hidden_size), P(None, model_axis)),
+        if adapter_config is not None and adapter_hidden_size is not None:
+            adapter_name = str(adapter_config["name"])
+            layer_entry["adapters"] = {
+                adapter_name: {
+                    "attention": {
+                        "in_proj": {
+                            "kernel":
+                            _leaf((hidden_size, adapter_hidden_size),
+                                  P(None, model_axis)),
+                        },
+                        "out_proj": {
+                            "kernel":
+                            _leaf((adapter_hidden_size, hidden_size),
+                                  P(model_axis, None)),
+                        },
                     },
-                    "out_proj": {
-                        "kernel": _leaf((adapter_hidden_size, hidden_size), P(model_axis, None)),
+                    "mlp": {
+                        "in_proj": {
+                            "kernel":
+                            _leaf((hidden_size, adapter_hidden_size),
+                                  P(None, model_axis)),
+                        },
+                        "out_proj": {
+                            "kernel":
+                            _leaf((adapter_hidden_size, hidden_size),
+                                  P(model_axis, None)),
+                        },
                     },
-                },
-                "mlp": {
-                    "in_proj": {
-                        "kernel": _leaf((hidden_size, adapter_hidden_size), P(None, model_axis)),
-                    },
-                    "out_proj": {
-                        "kernel": _leaf((adapter_hidden_size, hidden_size), P(model_axis, None)),
-                    },
-                },
+                }
             }
 
         template[layer_key] = layer_entry
@@ -343,63 +522,76 @@ def _iter_modlax_llama_hf_weights(
     checkpoint_config: dict[str, Any],
 ) -> Generator[tuple[str, jax.Array], None, None]:
     num_layers = int(checkpoint_config["num_hidden_layers"])
-    tie_word_embeddings = bool(checkpoint_config.get("tie_word_embeddings", True))
-    adapter_iffm = checkpoint_config.get("adapter_iffm")
-    adapter_hidden_size = None
-    if adapter_iffm is not None:
-        adapter_hidden_size = int(float(adapter_iffm) * int(checkpoint_config["hidden_size"]))
+    tie_word_embeddings = bool(
+        checkpoint_config.get("tie_word_embeddings", True))
+    adapter_config = get_single_modlax_adapter_config(
+        checkpoint_config.get("adapters"),
+        "Modlax checkpoint adapters",
+    )
 
     yield "model.embed_tokens.weight", params["token_embed"]
     for layer_index in range(num_layers):
         layer_key = f"layers_{layer_index}"
         layer_params = params[layer_key]
         prefix = f"model.layers.{layer_index}."
-        yield f"{prefix}input_layernorm.weight", layer_params["input_layernorm"]["weight"]
+        yield f"{prefix}input_layernorm.weight", layer_params[
+            "input_layernorm"]["weight"]
 
         attn_params = layer_params["self_attn"]
-        yield f"{prefix}self_attn.q_proj.weight", jnp.transpose(attn_params["q_proj"]["kernel"])
-        yield f"{prefix}self_attn.k_proj.weight", jnp.transpose(attn_params["k_proj"]["kernel"])
-        yield f"{prefix}self_attn.v_proj.weight", jnp.transpose(attn_params["v_proj"]["kernel"])
-        yield f"{prefix}self_attn.o_proj.weight", jnp.transpose(attn_params["o_proj"]["kernel"])
+        yield f"{prefix}self_attn.q_proj.weight", jnp.transpose(
+            attn_params["q_proj"]["kernel"])
+        yield f"{prefix}self_attn.k_proj.weight", jnp.transpose(
+            attn_params["k_proj"]["kernel"])
+        yield f"{prefix}self_attn.v_proj.weight", jnp.transpose(
+            attn_params["v_proj"]["kernel"])
+        yield f"{prefix}self_attn.o_proj.weight", jnp.transpose(
+            attn_params["o_proj"]["kernel"])
 
         yield (f"{prefix}post_attention_layernorm.weight",
                layer_params["post_attention_layernorm"]["weight"])
 
         mlp_params = layer_params["mlp"]
-        yield f"{prefix}mlp.gate_proj.weight", jnp.transpose(mlp_params["gate"]["kernel"])
-        yield f"{prefix}mlp.up_proj.weight", jnp.transpose(mlp_params["up"]["kernel"])
-        yield f"{prefix}mlp.down_proj.weight", jnp.transpose(mlp_params["down"]["kernel"])
+        yield f"{prefix}mlp.gate_proj.weight", jnp.transpose(
+            mlp_params["gate"]["kernel"])
+        yield f"{prefix}mlp.up_proj.weight", jnp.transpose(
+            mlp_params["up"]["kernel"])
+        yield f"{prefix}mlp.down_proj.weight", jnp.transpose(
+            mlp_params["down"]["kernel"])
 
-        if adapter_hidden_size is not None:
-            adapter_params = layer_params.get("adapter")
-            if adapter_params is None:
+        if adapter_config is not None:
+            adapter_name = str(adapter_config["name"])
+            adapters_params = layer_params.get("adapters")
+            if adapters_params is None or adapter_name not in adapters_params:
                 raise KeyError(
-                    "Modlax checkpoint config specifies adapters, but adapter parameters are missing."
-                )
+                    "Modlax checkpoint config specifies adapter "
+                    f"{adapter_name!r}, but adapter parameters are missing.")
+            adapter_params = adapters_params[adapter_name]
             attn_adapter = adapter_params["attention"]
             mlp_adapter = adapter_params["mlp"]
             yield (
-                f"{prefix}attn_adapter.in_proj_weight",
-                jnp.transpose(attn_adapter["in_proj"]["kernel"]),
+                f"{prefix}attn_adapter.in_proj.weight",
+                attn_adapter["in_proj"]["kernel"],
             )
             yield (
-                f"{prefix}attn_adapter.out_proj_weight",
-                jnp.transpose(attn_adapter["out_proj"]["kernel"]),
+                f"{prefix}attn_adapter.out_proj.weight",
+                attn_adapter["out_proj"]["kernel"],
             )
             yield (
-                f"{prefix}mlp_adapter.in_proj_weight",
-                jnp.transpose(mlp_adapter["in_proj"]["kernel"]),
+                f"{prefix}mlp_adapter.in_proj.weight",
+                mlp_adapter["in_proj"]["kernel"],
             )
             yield (
-                f"{prefix}mlp_adapter.out_proj_weight",
-                jnp.transpose(mlp_adapter["out_proj"]["kernel"]),
+                f"{prefix}mlp_adapter.out_proj.weight",
+                mlp_adapter["out_proj"]["kernel"],
             )
 
     yield "model.norm.weight", params["final_norm"]["weight"]
     if not tie_word_embeddings:
         lm_head = params.get("lm_head", {}).get("weight")
         if lm_head is None:
-            raise KeyError("Expected lm_head weights in non-tied Modlax Llama checkpoint.")
+            raise KeyError(
+                "Expected lm_head weights in non-tied Modlax Llama checkpoint."
+            )
         yield "lm_head.weight", lm_head
 
 
@@ -417,6 +609,206 @@ def _select_modlax_orbax_checkpoint_path(vllm_config: VllmConfig,
     return None
 
 
+def _model_config_jax_dtype(model_config: Any) -> jnp.dtype:
+    dtype = getattr(model_config, "dtype", jnp.bfloat16)
+    try:
+        return jnp.dtype(dtype)
+    except TypeError:
+        return _canonical_jax_dtype(str(dtype))
+
+
+def _runtime_llama_adapter_config(
+        vllm_config: VllmConfig) -> dict[str, Any] | None:
+    hf_config = vllm_config.model_config.hf_config
+    adapters = getattr(hf_config, "adapters", None)
+    if adapters is None or not isinstance(adapters, (list, tuple)):
+        return None
+    return get_single_modlax_adapter_config(
+        adapters,
+        "runtime Llama hf_config.adapters",
+    )
+
+
+def _validate_checkpoint_runtime_adapter_match(
+    vllm_config: VllmConfig,
+    checkpoint_adapter_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    runtime_adapter_config = _runtime_llama_adapter_config(vllm_config)
+    if checkpoint_adapter_config is not None and runtime_adapter_config is None:
+        raise ValueError(
+            "Checkpoint contains a Modlax adapter, but the running model was "
+            "not configured with an adapter.")
+    if (checkpoint_adapter_config is not None
+            and runtime_adapter_config is not None
+            and not modlax_adapter_configs_match(checkpoint_adapter_config,
+                                                 runtime_adapter_config)):
+        raise ValueError(
+            "Checkpoint adapter does not match running model adapter: "
+            f"checkpoint={checkpoint_adapter_config}, "
+            f"runtime={runtime_adapter_config}")
+    return runtime_adapter_config
+
+
+def _adapter_hidden_size(hidden_size: int, adapter_config: dict[str,
+                                                                Any]) -> int:
+    adapter_hidden_size = int(float(adapter_config["iffm"]) * hidden_size)
+    if adapter_hidden_size <= 0:
+        raise ValueError(
+            f"Adapter {adapter_config['name']!r} resolves to hidden size "
+            f"{adapter_hidden_size}; increase iffm.")
+    return adapter_hidden_size
+
+
+def _build_modlax_llama_adapter_restore_template(
+    vllm_config: VllmConfig,
+    adapter_config: dict[str, Any],
+    mesh: Mesh,
+) -> dict[str, Any]:
+    model_axis = _get_model_axis_name(mesh)
+    hf_config = vllm_config.model_config.hf_config
+    param_dtype = _model_config_jax_dtype(vllm_config.model_config)
+    hidden_size = int(hf_config.hidden_size)
+    adapter_hidden_size = _adapter_hidden_size(hidden_size, adapter_config)
+    num_layers = int(hf_config.num_hidden_layers)
+    adapter_name = str(adapter_config["name"])
+
+    def _leaf(shape: tuple[int, ...], spec: P) -> jax.ShapeDtypeStruct:
+        return jax.ShapeDtypeStruct(
+            shape=shape,
+            dtype=param_dtype,
+            sharding=NamedSharding(mesh, spec),
+        )
+
+    template: dict[str, Any] = {}
+    for layer_index in range(num_layers):
+        template[f"layers_{layer_index}"] = {
+            "adapters": {
+                adapter_name: {
+                    "attention": {
+                        "in_proj": {
+                            "kernel":
+                            _leaf((hidden_size, adapter_hidden_size),
+                                  P(None, model_axis)),
+                        },
+                        "out_proj": {
+                            "kernel":
+                            _leaf((adapter_hidden_size, hidden_size),
+                                  P(model_axis, None)),
+                        },
+                    },
+                    "mlp": {
+                        "in_proj": {
+                            "kernel":
+                            _leaf((hidden_size, adapter_hidden_size),
+                                  P(None, model_axis)),
+                        },
+                        "out_proj": {
+                            "kernel":
+                            _leaf((adapter_hidden_size, hidden_size),
+                                  P(model_axis, None)),
+                        },
+                    },
+                }
+            }
+        }
+    return template
+
+
+def _iter_modlax_llama_adapter_hf_weights(
+    params: dict[str, Any],
+    adapter_config: dict[str, Any],
+    num_layers: int,
+) -> Generator[tuple[str, jax.Array], None, None]:
+    adapter_name = str(adapter_config["name"])
+    for layer_index in range(num_layers):
+        layer_params = params[f"layers_{layer_index}"]
+        adapters_params = layer_params.get("adapters")
+        if adapters_params is None or adapter_name not in adapters_params:
+            raise KeyError(
+                f"Adapter checkpoint is missing layer {layer_index} adapter "
+                f"{adapter_name!r}.")
+        adapter_params = adapters_params[adapter_name]
+        prefix = f"model.layers.{layer_index}."
+        attn_adapter = adapter_params["attention"]
+        mlp_adapter = adapter_params["mlp"]
+        yield f"{prefix}attn_adapter.in_proj.weight", attn_adapter["in_proj"][
+            "kernel"]
+        yield f"{prefix}attn_adapter.out_proj.weight", attn_adapter[
+            "out_proj"]["kernel"]
+        yield f"{prefix}mlp_adapter.in_proj.weight", mlp_adapter["in_proj"][
+            "kernel"]
+        yield f"{prefix}mlp_adapter.out_proj.weight", mlp_adapter["out_proj"][
+            "kernel"]
+
+
+def _zero_initialize_runtime_llama_adapter_weights(
+    vllm_config: VllmConfig,
+    params: nnx.State,
+    shardings: Any,
+    metadata_map: "MetadataMap",
+    mesh: Mesh,
+    runtime_adapter_config: dict[str, Any] | None,
+    keep_hf_weight_suffix_when_match: list[str],
+    pp_missing_layers: list[str] | None = None,
+) -> None:
+    if runtime_adapter_config is None:
+        return
+
+    hf_config = vllm_config.model_config.hf_config
+    hidden_size = int(hf_config.hidden_size)
+    adapter_hidden_size = _adapter_hidden_size(hidden_size,
+                                               runtime_adapter_config)
+    param_dtype = _model_config_jax_dtype(vllm_config.model_config)
+    num_layers = int(hf_config.num_hidden_layers)
+    shapes = {
+        "attn_adapter.in_proj.weight": (hidden_size, adapter_hidden_size),
+        "attn_adapter.out_proj.weight": (adapter_hidden_size, hidden_size),
+        "mlp_adapter.in_proj.weight": (hidden_size, adapter_hidden_size),
+        "mlp_adapter.out_proj.weight": (adapter_hidden_size, hidden_size),
+    }
+    for layer_index in range(num_layers):
+        for suffix, shape in shapes.items():
+            _load_and_shard_weight(
+                vllm_config,
+                params,
+                shardings,
+                metadata_map,
+                mesh,
+                f"model.layers.{layer_index}.{suffix}",
+                jnp.zeros(shape, dtype=param_dtype),
+                keep_original_dtype_keys_regex=None,
+                pp_missing_layers=pp_missing_layers,
+                keep_hf_weight_suffix_when_match=
+                keep_hf_weight_suffix_when_match,
+            )
+
+
+def _has_unloaded_runtime_llama_adapter_weights(
+    params: nnx.State,
+    runtime_adapter_config: dict[str, Any] | None,
+    num_layers: int,
+) -> bool:
+    if runtime_adapter_config is None:
+        return False
+    suffixes = (
+        "attn_adapter.in_proj.kernel",
+        "attn_adapter.out_proj.kernel",
+        "mlp_adapter.in_proj.kernel",
+        "mlp_adapter.out_proj.kernel",
+    )
+    for layer_index in range(num_layers):
+        for suffix in suffixes:
+            try:
+                param = get_param(params,
+                                  f"model.layers.{layer_index}.{suffix}")
+            except ValueError:
+                continue
+            if isinstance(param, nnx.Param) and isinstance(
+                    param.value, jax.ShapeDtypeStruct):
+                return True
+    return False
+
+
 def _load_modlax_orbax_llama_weights(
     vllm_config: VllmConfig,
     params: nnx.State,
@@ -429,12 +821,11 @@ def _load_modlax_orbax_llama_weights(
     keep_original_dtype_keys_regex: Optional[list[str]] = None,
     pp_missing_layers: list[str] | None = None,
 ) -> None:
-    architectures = getattr(vllm_config.model_config.hf_config, "architectures",
-                            [])
+    architectures = getattr(vllm_config.model_config.hf_config,
+                            "architectures", [])
     if "LlamaForCausalLM" not in architectures:
         raise NotImplementedError(
-            "Modlax Orbax loading currently supports LlamaForCausalLM only."
-        )
+            "Modlax Orbax loading currently supports LlamaForCausalLM only.")
 
     resolved_checkpoint_path = _resolve_modlax_orbax_checkpoint_path(
         checkpoint_path)
@@ -445,8 +836,14 @@ def _load_modlax_orbax_llama_weights(
 
     checkpoint_config = _load_modlax_orbax_checkpoint_config(
         resolved_checkpoint_path)
-    restore_template = _build_modlax_llama_restore_template(checkpoint_config,
-                                                             mesh)
+    checkpoint_adapter_config = get_single_modlax_adapter_config(
+        checkpoint_config.get("adapters"),
+        "Modlax checkpoint adapters",
+    )
+    runtime_adapter_config = _validate_checkpoint_runtime_adapter_match(
+        vllm_config, checkpoint_adapter_config)
+    restore_template = _build_modlax_llama_restore_template(
+        checkpoint_config, mesh)
     ocp = _import_orbax_checkpoint()
     logger.info("Loading Modlax Orbax Llama checkpoint from %s",
                 resolved_checkpoint_path)
@@ -470,6 +867,78 @@ def _load_modlax_orbax_llama_weights(
             hf_key,
             hf_weight,
             keep_original_dtype_keys_regex=keep_original_dtype_keys_regex,
+            pp_missing_layers=pp_missing_layers,
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match,
+        )
+
+    if checkpoint_adapter_config is None:
+        _zero_initialize_runtime_llama_adapter_weights(
+            vllm_config=vllm_config,
+            params=params,
+            shardings=shardings,
+            metadata_map=metadata_map,
+            mesh=mesh,
+            runtime_adapter_config=runtime_adapter_config,
+            pp_missing_layers=pp_missing_layers,
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match,
+        )
+
+
+def load_modlax_orbax_llama_adapter_weights(
+    vllm_config: VllmConfig,
+    params: nnx.State,
+    shardings: Any,
+    metadata_map: "MetadataMap",
+    mesh: Mesh,
+    checkpoint_path: str,
+    keep_hf_weight_suffix_when_match: list[str],
+    pp_missing_layers: list[str] | None = None,
+) -> None:
+    architectures = getattr(vllm_config.model_config.hf_config,
+                            "architectures", [])
+    if "LlamaForCausalLM" not in architectures:
+        raise NotImplementedError(
+            "Modlax adapter-only loading currently supports LlamaForCausalLM only."
+        )
+
+    resolved_checkpoint_path = _resolve_modlax_adapter_orbax_checkpoint_path(
+        checkpoint_path)
+    if resolved_checkpoint_path is None:
+        raise FileNotFoundError(
+            "Modlax adapter checkpoint markers were not found at: "
+            f"{checkpoint_path}")
+
+    adapter_config = _load_modlax_adapter_checkpoint_config(
+        resolved_checkpoint_path)
+    runtime_adapter_config = _validate_checkpoint_runtime_adapter_match(
+        vllm_config, adapter_config)
+    if runtime_adapter_config is None:
+        raise ValueError(
+            "Adapter-only reload requires the running model to be configured "
+            "with exactly one Modlax adapter.")
+
+    restore_template = _build_modlax_llama_adapter_restore_template(
+        vllm_config, adapter_config, mesh)
+    ocp = _import_orbax_checkpoint()
+    logger.info("Loading Modlax Orbax Llama adapter checkpoint from %s",
+                resolved_checkpoint_path)
+    with ocp.StandardCheckpointer() as checkpointer:
+        restored_params = checkpointer.restore(resolved_checkpoint_path,
+                                               target=restore_template)
+
+    restored_params = jax.tree_util.tree_map(jnp.asarray, restored_params)
+    num_layers = int(vllm_config.model_config.hf_config.num_hidden_layers)
+    for hf_key, hf_weight in _iter_modlax_llama_adapter_hf_weights(
+            restored_params, adapter_config, num_layers):
+        _load_and_shard_weight(
+            vllm_config,
+            params,
+            shardings,
+            metadata_map,
+            mesh,
+            hf_key,
+            hf_weight,
+            keep_original_dtype_keys_regex=None,
             pp_missing_layers=pp_missing_layers,
             keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match,
         )
@@ -981,8 +1450,8 @@ def load_hf_weights(
             )
     else:
         # File-based path (multi-threaded)
-        weights_files = get_model_weights_files(model_path,
-                                                vllm_config.load_config.download_dir)
+        weights_files = get_model_weights_files(
+            model_path, vllm_config.load_config.download_dir)
         max_workers = min(64, len(weights_files))
         # NOTE(xiang): Disable multi-threading mode if running on multi-host.
         # Because multi-threading would cause different JAX processes to load
@@ -1008,6 +1477,26 @@ def load_hf_weights(
             ]
             for future in futures:
                 future.result()
+
+    if not is_draft_model and "LlamaForCausalLM" in getattr(
+            vllm_config.model_config.hf_config, "architectures", []):
+        runtime_adapter_config = _runtime_llama_adapter_config(vllm_config)
+        if _has_unloaded_runtime_llama_adapter_weights(
+                params,
+                runtime_adapter_config,
+                int(vllm_config.model_config.hf_config.num_hidden_layers),
+        ):
+            _zero_initialize_runtime_llama_adapter_weights(
+                vllm_config=vllm_config,
+                params=params,
+                shardings=shardings,
+                metadata_map=metadata_map,
+                mesh=mesh,
+                runtime_adapter_config=runtime_adapter_config,
+                pp_missing_layers=pp_missing_layers,
+                keep_hf_weight_suffix_when_match=
+                keep_hf_weight_suffix_when_match,
+            )
 
     check_all_loaded(params)
     nnx.update(model, params)
@@ -1158,6 +1647,38 @@ class StandardWeightLoader(BaseWeightLoader):
             mesh=self.mesh,
             pp_missing_layers=getattr(model, 'pp_missing_layers', []),
             keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match)
+
+    def load_adapter_weights(
+        self,
+        model: nnx.Module,
+        mappings: dict | MetadataMap,
+        checkpoint_path: str,
+        keep_hf_weight_suffix_when_match: list[str] = [],
+    ):
+        if isinstance(mappings, MetadataMap):
+            metadata_map = mappings
+        else:
+            metadata_map = get_default_maps(self.vllm_config.model_config,
+                                            self.mesh, mappings)
+
+        params = nnx.state(model)
+        try:
+            shardings = nnx.get_named_sharding(params, self.mesh)
+        except TypeError:
+            shardings = params
+
+        load_modlax_orbax_llama_adapter_weights(
+            vllm_config=self.vllm_config,
+            params=params,
+            shardings=shardings,
+            metadata_map=metadata_map,
+            mesh=self.mesh,
+            checkpoint_path=checkpoint_path,
+            pp_missing_layers=getattr(model, 'pp_missing_layers', []),
+            keep_hf_weight_suffix_when_match=keep_hf_weight_suffix_when_match,
+        )
+        check_all_loaded(params)
+        nnx.update(model, params)
 
 
 def load_nnx_param_from_reshaped_torch(

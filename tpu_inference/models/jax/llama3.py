@@ -41,11 +41,47 @@ logger = init_logger(__name__)
 init_fn = nnx.initializers.uniform()
 
 
+def _zero_init(key: jax.Array, shape: tuple[int, ...],
+               dtype: jnp.dtype) -> jax.Array:
+    del key
+    return jnp.zeros(shape, dtype=dtype)
+
+
+def _get_single_adapter_config(
+        config: LlamaConfig) -> dict[str, float | str] | None:
+    adapters = getattr(config, "adapters", None) or []
+    if len(adapters) > 1:
+        raise ValueError(
+            "The TPU Llama runtime supports at most one Modlax adapter.")
+    if not adapters:
+        return None
+    adapter = adapters[0]
+    if isinstance(adapter, dict):
+        name = adapter["name"]
+        iffm = adapter["iffm"]
+    else:
+        name = getattr(adapter, "name")
+        iffm = getattr(adapter, "iffm")
+    return {"name": str(name), "iffm": float(iffm)}
+
+
+def _get_adapter_hidden_size(config: LlamaConfig,
+                             adapter_config: dict[str, float | str]) -> int:
+    adapter_hidden_size = int(
+        float(adapter_config["iffm"]) * config.hidden_size)
+    if adapter_hidden_size <= 0:
+        raise ValueError(
+            f"Adapter {adapter_config['name']!r} resolves to hidden size "
+            f"{adapter_hidden_size}; increase iffm.")
+    return adapter_hidden_size
+
+
 def _resolve_llama_4_scaling(config: LlamaConfig) -> dict[str, float] | None:
     llama_4_scaling = getattr(config, "llama_4_scaling", None)
     if isinstance(llama_4_scaling, dict):
         return {
-            "beta": float(llama_4_scaling["beta"]),
+            "beta":
+            float(llama_4_scaling["beta"]),
             "original_max_position_embeddings":
             float(llama_4_scaling["original_max_position_embeddings"]),
         }
@@ -59,7 +95,8 @@ def _resolve_llama_4_scaling(config: LlamaConfig) -> dict[str, float] | None:
     if scaling_beta is None or original_max_position_embeddings is None:
         return None
     return {
-        "beta": float(scaling_beta),
+        "beta":
+        float(scaling_beta),
         "original_max_position_embeddings":
         float(original_max_position_embeddings),
     }
@@ -107,6 +144,36 @@ class LlamaMLP(nnx.Module):
         fuse = gate * up
         result = self.down_proj(fuse)
         return result
+
+
+class LlamaResidualAdapter(nnx.Module):
+
+    def __init__(self, config: LlamaConfig, adapter_hidden_size: int,
+                 dtype: jnp.dtype, rng: nnx.Rngs):
+        hidden_size = config.hidden_size
+        self.in_proj = nnx.Linear(
+            hidden_size,
+            adapter_hidden_size,
+            use_bias=False,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(
+                _zero_init, (None, ShardingAxisName.MLP_TENSOR)),
+            rngs=rng,
+        )
+        self.out_proj = nnx.Linear(
+            adapter_hidden_size,
+            hidden_size,
+            use_bias=False,
+            param_dtype=dtype,
+            kernel_init=nnx.with_partitioning(
+                _zero_init, (ShardingAxisName.MLP_TENSOR, None)),
+            rngs=rng,
+        )
+
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        updated = self.out_proj(
+            jax.nn.gelu(self.in_proj(hidden_states), approximate=False))
+        return updated + hidden_states
 
 
 class LlamaAttention(nnx.Module):
@@ -187,8 +254,9 @@ class LlamaAttention(nnx.Module):
                        self.rope_theta, self.rope_scaling)
         if self.llama_4_scaling is not None:
             query_scaling = 1.0 + self.llama_4_scaling["beta"] * jnp.log1p(
-                jnp.floor(md.input_positions.astype(jnp.float32) /
-                          self.llama_4_scaling["original_max_position_embeddings"]))
+                jnp.floor(
+                    md.input_positions.astype(jnp.float32) /
+                    self.llama_4_scaling["original_max_position_embeddings"]))
             q = q * query_scaling[:, None, None].astype(q.dtype)
         # k: (T, K, H)
         k = self.k_proj(x)
@@ -253,6 +321,25 @@ class LlamaDecoderLayer(nnx.Module):
             dtype=dtype,
             rng=rng,
         )
+        adapter_config = _get_single_adapter_config(config)
+        if adapter_config is None:
+            self.attn_adapter = None
+            self.mlp_adapter = None
+        else:
+            adapter_hidden_size = _get_adapter_hidden_size(
+                config, adapter_config)
+            self.attn_adapter = LlamaResidualAdapter(
+                config=config,
+                adapter_hidden_size=adapter_hidden_size,
+                dtype=dtype,
+                rng=rng,
+            )
+            self.mlp_adapter = LlamaResidualAdapter(
+                config=config,
+                adapter_hidden_size=adapter_hidden_size,
+                dtype=dtype,
+                rng=rng,
+            )
 
     def __call__(
         self,
@@ -266,11 +353,15 @@ class LlamaDecoderLayer(nnx.Module):
             hidden_states,
             attention_metadata,
         )
+        if self.attn_adapter is not None:
+            attn_output = self.attn_adapter(attn_output)
         attn_output += x
 
         residual = attn_output
         attn_output = self.post_attention_layernorm(attn_output)
         outputs = self.mlp(attn_output)
+        if self.mlp_adapter is not None:
+            outputs = self.mlp_adapter(outputs)
         outputs = residual + outputs
         return kv_cache, outputs
 
@@ -426,11 +517,7 @@ class LlamaForCausalLM(nnx.Module):
             logits = jnp.dot(hidden_states, self.model.lm_head.value)
         return logits
 
-    def load_weights(self, rng_key: jax.Array):
-        # NOTE: Since we are using nnx.eval_shape to init the model,
-        # we have to pass dynamic arrays here for __call__'s usage.
-        self.rng = nnx.Rngs(rng_key)
-
+    def _weight_mappings(self) -> dict[str, str]:
         # Key: path to a HF layer weight
         # Value: path to a nnx layer weight
         mappings = {
@@ -452,6 +539,14 @@ class LlamaForCausalLM(nnx.Module):
             "model.layers.*.self_attn.q_proj.kernel",
             "model.layers.*.self_attn.v_proj":
             "model.layers.*.self_attn.v_proj.kernel",
+            "model.layers.*.attn_adapter.in_proj":
+            "model.layers.*.attn_adapter.in_proj.kernel",
+            "model.layers.*.attn_adapter.out_proj":
+            "model.layers.*.attn_adapter.out_proj.kernel",
+            "model.layers.*.mlp_adapter.in_proj":
+            "model.layers.*.mlp_adapter.in_proj.kernel",
+            "model.layers.*.mlp_adapter.out_proj":
+            "model.layers.*.mlp_adapter.out_proj.kernel",
             "model.norm": "model.norm.scale",
         }
         # Add lm_head mapping only if it's not tied to embeddings
@@ -459,6 +554,17 @@ class LlamaForCausalLM(nnx.Module):
             mappings.update({
                 "lm_head": "model.lm_head",
             })
+        return mappings
+
+    def load_weights(self, rng_key: jax.Array):
+        # NOTE: Since we are using nnx.eval_shape to init the model,
+        # we have to pass dynamic arrays here for __call__'s usage.
+        self.rng = nnx.Rngs(rng_key)
 
         loader = self.WeightLoader(self.vllm_config, self.mesh)
-        loader.load_weights(self, mappings)
+        loader.load_weights(self, self._weight_mappings())
+
+    def load_adapter_weights(self, checkpoint_path: str):
+        loader = self.WeightLoader(self.vllm_config, self.mesh)
+        loader.load_adapter_weights(self, self._weight_mappings(),
+                                    checkpoint_path)
