@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.request import RequestStatus
@@ -18,11 +19,169 @@ from tpu_inference.vllm_runtime_patches import (
     filter_scheduler_output_missing_req_indices,
     patch_async_scheduler_preempt_discard,
     patch_async_llm_request_admission_gate,
+    patch_native_logprob_eos_detokenization,
     requeue_missing_live_reload_requests,
     run_with_request_admission_gate,
 )
+from tpu_inference.runner.logprob_options import (
+    RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG,
+)
 
 pytestmark = pytest.mark.online_rl_server_related
+
+
+class _FakeDetokenizerRequest:
+
+    def __init__(
+        self,
+        *,
+        eos_token_id: int,
+        native_token_logprobs: bool,
+        stop: list[str] | None = None,
+    ) -> None:
+        self.eos_token_id = eos_token_id
+        self.sampling_params = SimpleNamespace(
+            stop=stop,
+            min_tokens=0,
+            include_stop_str_in_output=False,
+            extra_args=({
+                RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG: True
+            } if native_token_logprobs else {}),
+        )
+
+
+def _make_fake_text_detokenizer(
+    *,
+    native_token_logprobs: bool,
+    stop: list[str] | None = None,
+):
+    from vllm.v1.engine.detokenizer import BaseIncrementalDetokenizer
+
+    class _FakeTextDetokenizer(BaseIncrementalDetokenizer):
+        _TOKEN_TEXT = {
+            11: "hello",
+            22: "STOP",
+            99: "<EOS>",
+        }
+
+        def decode_next(self, next_token_id: int) -> str:
+            return self._TOKEN_TEXT[next_token_id]
+
+    return _FakeTextDetokenizer(
+        _FakeDetokenizerRequest(
+            eos_token_id=99,
+            native_token_logprobs=native_token_logprobs,
+            stop=stop,
+        ))
+
+
+def test_native_logprob_eos_detokenization_patch_preserves_default_stop_text_skip(
+):
+    patch_native_logprob_eos_detokenization()
+
+    detokenizer = _make_fake_text_detokenizer(native_token_logprobs=False)
+    stop_string = detokenizer.update([11, 99], stop_terminated=True)
+
+    assert stop_string is None
+    assert detokenizer.output_text == "hello"
+    assert detokenizer.output_token_ids == [11, 99]
+
+
+def test_native_logprob_eos_detokenization_patch_includes_eos_text_for_flagged_request(
+):
+    patch_native_logprob_eos_detokenization()
+
+    detokenizer = _make_fake_text_detokenizer(native_token_logprobs=True)
+    stop_string = detokenizer.update([11, 99], stop_terminated=True)
+
+    assert stop_string is None
+    assert detokenizer.output_text == "hello<EOS>"
+    assert detokenizer.output_token_ids == [11, 99]
+
+
+def test_native_logprob_eos_detokenization_patch_still_strips_stop_strings():
+    patch_native_logprob_eos_detokenization()
+
+    detokenizer = _make_fake_text_detokenizer(
+        native_token_logprobs=True,
+        stop=["STOP"],
+    )
+    detokenizer.update([11], stop_terminated=False)
+    stop_string = detokenizer.update([22], stop_terminated=False)
+
+    assert stop_string == "STOP"
+    assert detokenizer.output_text == "hello"
+    assert detokenizer.output_token_ids == [11, 22]
+
+
+def test_native_logprob_eos_request_output_keeps_text_tokens_and_logprobs():
+    from vllm.logprobs import create_sample_logprobs
+    from vllm.sampling_params import RequestOutputKind
+    from vllm.v1.engine import EngineCoreOutput, FinishReason
+    from vllm.v1.engine.logprobs import LogprobsProcessor
+    from vllm.v1.engine.output_processor import RequestState
+    from vllm.v1.outputs import LogprobsLists
+
+    patch_native_logprob_eos_detokenization()
+    detokenizer = _make_fake_text_detokenizer(native_token_logprobs=True)
+    logprobs_processor = LogprobsProcessor(
+        tokenizer=None,
+        logprobs=create_sample_logprobs(flat_logprobs=False),
+        prompt_logprobs=None,
+        cumulative_logprob=0.0,
+        num_logprobs=1,
+        num_prompt_logprobs=None,
+    )
+    req_state = RequestState(
+        request_id="req-0",
+        external_req_id="req-0",
+        parent_req=None,
+        request_index=0,
+        lora_request=None,
+        output_kind=RequestOutputKind.FINAL_ONLY,
+        prompt="",
+        prompt_token_ids=[1],
+        prompt_embeds=None,
+        logprobs_processor=logprobs_processor,
+        detokenizer=detokenizer,
+        max_tokens_param=2,
+        arrival_time=0.0,
+        queue=None,
+        log_stats=False,
+        stream_interval=1,
+    )
+    engine_output = EngineCoreOutput(
+        request_id="req-0",
+        new_token_ids=[11, 99],
+        finish_reason=FinishReason.STOP,
+        stop_reason=None,
+        new_logprobs=LogprobsLists(
+            logprob_token_ids=np.array([[11, 0], [99, 0]], dtype=np.int32),
+            logprobs=np.array([[-0.1, -10.0], [-0.2, -11.0]],
+                              dtype=np.float32),
+            sampled_token_ranks=np.array([1, 1], dtype=np.int32),
+        ),
+    )
+
+    stop_string = detokenizer.update(
+        engine_output.new_token_ids,
+        engine_output.finish_reason == FinishReason.STOP,
+    )
+    logprobs_processor.update_from_output(engine_output)
+    request_output = req_state.make_request_output(
+        engine_output.new_token_ids,
+        pooling_output=None,
+        finish_reason=engine_output.finish_reason,
+        stop_reason=engine_output.stop_reason,
+    )
+
+    assert stop_string is None
+    assert request_output is not None
+    completion_output = request_output.outputs[0]
+    assert completion_output.text == "hello<EOS>"
+    assert completion_output.token_ids == [11, 99]
+    assert len(completion_output.logprobs) == 2
+    assert completion_output.logprobs[1][99].logprob == pytest.approx(-0.2)
 
 
 def test_tpu_worker_import_installs_vllm_runtime_patches():

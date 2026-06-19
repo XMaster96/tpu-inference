@@ -8,6 +8,9 @@ from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 from tpu_inference.logger import init_logger
+from tpu_inference.runner.logprob_options import (
+    RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG,
+)
 
 logger = init_logger(__name__)
 _T = TypeVar("_T")
@@ -735,6 +738,45 @@ def patch_async_llm_request_admission_gate() -> None:
     AsyncLLM._tpu_request_admission_gate_patch_installed = True
 
 
+def patch_native_logprob_eos_detokenization() -> None:
+    """Keep EOS text for native-logprob requests without changing stop strings."""
+    try:
+        from vllm.v1.engine.detokenizer import BaseIncrementalDetokenizer
+    except Exception:
+        return
+
+    if getattr(
+        BaseIncrementalDetokenizer,
+        "_tpu_native_logprob_eos_detokenization_patch_installed",
+        False,
+    ):
+        return
+
+    original_init = BaseIncrementalDetokenizer.__init__
+    original_update = BaseIncrementalDetokenizer.update
+
+    def _patched_init(self, request, *args, **kwargs):
+        original_init(self, request, *args, **kwargs)
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        self._tpu_return_native_token_logprobs = bool(
+            extra_args.get(RETURN_NATIVE_TOKEN_LOGPROBS_EXTRA_ARG))
+        self._tpu_eos_token_id = getattr(request, "eos_token_id", None)
+
+    def _patched_update(self, new_token_ids, stop_terminated):
+        if (stop_terminated and new_token_ids
+                and getattr(self, "_tpu_return_native_token_logprobs", False)
+                and new_token_ids[-1] == getattr(self, "_tpu_eos_token_id",
+                                                 None)):
+            return original_update(self, new_token_ids, False)
+        return original_update(self, new_token_ids, stop_terminated)
+
+    BaseIncrementalDetokenizer.__init__ = _patched_init
+    BaseIncrementalDetokenizer.update = _patched_update
+    BaseIncrementalDetokenizer._tpu_native_logprob_eos_detokenization_patch_installed = (
+        True)
+
+
 def patch_scheduler_reload_stale_output() -> None:
     """Patch Scheduler to drop outputs invalidated by reload preemption."""
     try:
@@ -1000,4 +1042,5 @@ def apply_vllm_runtime_patches() -> None:
             )
     patch_async_llm_request_admission_gate()
     patch_async_scheduler_preempt_discard()
+    patch_native_logprob_eos_detokenization()
     patch_scheduler_reload_stale_output()
